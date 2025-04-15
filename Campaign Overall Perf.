@@ -1,0 +1,307 @@
+WITH accounts AS (
+    SELECT
+        acc.id as physical_id,
+        min_by(dm.uuid, onboarding_status) as restaurant_uuid, -- to remove the lost and duplicate storefronts
+        min_by(dm.store_name, onboarding_status) as store_name,
+        min_by(dm.eats_marketplace_fee, onboarding_status) as MPF,
+        DATE_FORMAT(DATE(min_by(dm.first_order_timestamp_local, onboarding_status)), '%Y-%m-%d') as ft_date,
+        DATE_FORMAT(DATE(min_by(acc.customer_won_date__c, onboarding_status)), '%Y-%m-%d') as cw_date,
+        min_by(dm.eats_max_delivery_radius, onboarding_status) as max_radius,
+        min_by(dm.onboarding_status, onboarding_status) as onboarding_status,
+        min_by(dm.is_visible, onboarding_status) as is_visible,
+        min_by(dm.latitude, onboarding_status) as lat,
+        min_by(dm.longitude, onboarding_status) as lng,
+        min_by(dm.uuid, location_type) as location_type,
+        max_by(acc.ownerid,acc.lastmodifieddate) AS acc_user_id,
+        max_by(acc.id,acc.lastmodifieddate) AS acc_id,
+        max_by(acc3.name,acc.lastmodifieddate) as group_name,
+        max_by(acc3.id,acc.lastmodifieddate) as group_id,
+        max_by(acc3.ownerid,acc.lastmodifieddate) AS parent_user_id   
+    FROM secure_kirby_external_data.salesforce_eats_account acc -- Physical Location
+    LEFT JOIN secure_kirby_external_data.salesforce_eats_account acc2 on acc.id = acc2.parentid -- Storefront
+    LEFT JOIN secure_kirby_external_data.salesforce_eats_account acc3 on acc3.id = acc.parentid and acc3.record_type__c = 'Group_Account'
+    RIGHT JOIN eds.dim_merchant dm on coalesce(acc2.uuid__c,acc.uuid__c) = dm.uuid
+    WHERE 1=1
+        and acc.record_type__c in ('Physical_Location', 'UberEverything_Account_Record_Type')
+        and acc.service_country__c IN ('Taiwan')
+        and acc.isdeleted <> TRUE
+        and dm.city_id in (94,965,1077,1139,1854,1944,2090,2091,2092,2132,2157)
+    GROUP BY
+        1
+)
+
+, pre_base AS (
+    select
+            restaurant_uuid
+            ,store_name 
+            ,group_name
+            ,group_id 
+            ,MPF
+            ,ft_date
+            ,cw_date
+            ,case when onboarding_status <>'activated' then onboarding_status when is_visible = true then 'visible' else 'invisible' end as onboarding_status
+            ,g.name AS abv_city
+            ,g.city
+            ,g.district
+            ,g.region AS geo_region
+            ,round(max_radius,2) as radius --miles
+            ,case 
+                when max_by(us.msg.manager_full_name__c,ts) = 'Daniel Lee' or max_by(us.msg.name,ts) = 'Daniel Lee' then 'N1'
+                when max_by(us.msg.manager_full_name__c,ts) = 'Gia Li'    or max_by(us.msg.name,ts) = 'Gia Li'    then 'N2' 
+                when max_by(us.msg.manager_full_name__c,ts) = 'Vicky Huang'  or max_by(us.msg.name,ts) = 'Vicky Huang'  then 'N3' 
+                when max_by(us.msg.manager_full_name__c,ts) = 'Louise Lin'    or max_by(us.msg.name,ts) = 'Louise Lin'    then 'N4' 
+                when max_by(us.msg.manager_full_name__c,ts) = 'Gwen Fang' or max_by(us.msg.name,ts) = 'Gwen Fang' then 'C1' 
+                when max_by(us.msg.manager_full_name__c,ts) = 'Tim Liu' or max_by(us.msg.name,ts) = 'Tim Liu' then 'C2'
+                when max_by(us.msg.manager_full_name__c,ts) = 'Mark Huang' or max_by(us.msg.name,ts) = 'Mark Huang' then 'S1'
+                else 'NN' end as region
+            ,case
+                when max_by(location_type,ts) = 'GROCERY_STORE' OR max_by(us.msg.name,ts) = 'Ann Cheng' OR max_by(us.msg.manager_full_name__c,ts) = 'Ann Cheng' then 'NV'
+                when max_by(us.msg.name,ts) = 'Daniel Lee' OR max_by(us.msg.manager_full_name__c,ts) = 'Daniel Lee'
+                    OR max_by(us.msg.name,ts) = 'Gia Li' OR max_by(us.msg.manager_full_name__c,ts) = 'Gia Li'
+                    OR max_by(us.msg.name,ts) = 'Vicky Huang' OR max_by(us.msg.manager_full_name__c,ts) = 'Vicky Huang'
+                    OR max_by(us.msg.name,ts) = 'Louise Lin' OR max_by(us.msg.manager_full_name__c,ts) = 'Louise Lin'
+                    OR max_by(us.msg.name,ts) = 'Gwen Fang' OR max_by(us.msg.manager_full_name__c,ts) = 'Gwen Fang'
+                    OR max_by(us.msg.name,ts) = 'Tim Liu' OR max_by(us.msg.manager_full_name__c,ts) = 'Tim Liu'
+                    OR max_by(us.msg.name,ts) = 'Mark Huang' OR max_by(us.msg.manager_full_name__c,ts) = 'Mark Huang'
+                    OR max_by(us.msg.name,ts) = 'Brian Wu' OR max_by(us.msg.manager_full_name__c,ts) = 'Brian Wu'
+                    OR max_by(us.msg.name,ts) = 'Leo Lee' OR max_by(us.msg.manager_full_name__c,ts) = 'Leo Lee' THEN 'MM'
+                WHEN max_by(us.msg.name,ts) = 'Borg Lai' OR max_by(us.msg.manager_full_name__c,ts) = 'Borg Lai' THEN 'Strategic'
+                else 'none' end as team
+            ,coalesce(max_by(us.msg.manager_full_name__c,ts),max_by(us.msg.name,ts)) as AM_Manager
+            ,max_by(us.msg.name,ts) as AM
+
+        from accounts a
+        join rawdata_user.kafka_hp_ubereats_sfdc_user_v1_nodedup us on us.msg.id = coalesce(a.parent_user_id,a.acc_user_id) and date(us.datestr) >= current_date- interval '2' day
+        join (select * from kirby_external_data.tw_368geo tw join map_geofences.geofences using (geo_uuid, name)) g
+            on st_contains(shape,'POINT('||cast(lng as varchar)||' '||cast(lat as varchar)||')') 
+        group by 1,2,3,4,5,6,7,8,9,10,11,12,13
+)
+
+, base AS (
+    
+    SELECT es.wok_restaurant_uuid AS restaurant_uuid,
+    es.wok_store_name AS store_name,
+    es.sfdc_parent_name AS group_name,
+    pb.group_id AS group_id,
+    pb.MPF AS MPF,
+    es.first_trip_date AS ft_date,
+    es.opp_closedate AS cw_date,
+    es.wok_account_status AS onboarding_status,
+    pb.abv_city AS abv_city,
+    es.city_name AS city,
+    pb.district AS district,
+    pb.geo_region AS geo_region,
+    pb.radius AS radius
+    
+    FROM eats_salesops.onboarding  es
+    LEFT JOIN pre_base pb
+    ON es.wok_restaurant_uuid = pb.restaurant_uuid
+    WHERE  es.wok_account_status = 'activated' 
+        and restaurant_uuid IN ({{uuid}})
+)
+
+
+, promo_data AS(
+    SELECT DISTINCT
+        rp.restaurant_uuid,
+        b.group_id,
+        rp.promotion_uuid,
+        FROM_UNIXTIME(cast(start_at / 1000 + 28800 as bigint)) AS start_at,
+        FROM_UNIXTIME(cast(end_at / 1000 + 28800 as bigint)) AS end_at,
+        FROM_UNIXTIME(cast(revoked_deleted_at / 1000 + 28800 as bigint)) AS revoked_deleted_at,
+        FROM_UNIXTIME(latest_redemption_timestamp_local) AS latest_redemption,
+        case when rp.promotion_type = 'FREEITEM' and rp.min_basket_size = 0  then 'BOGO' else rp.promotion_type end as promotion_type,
+        rp.min_basket_size/32.48 AS min_basket_size,
+        rp.total_budget_used,
+        rp.num_redemptions,
+        rp.total_sales,
+        CASE WHEN case when rp.promotion_type = 'FREEITEM' and rp.min_basket_size = 0  then 'BOGO' else rp.promotion_type end = 'DISCOUNTEDITEM' THEN CAST(perc_discount AS DECIMAL(14,4))
+             WHEN case when rp.promotion_type = 'FREEITEM' and rp.min_basket_size = 0  then 'BOGO' else rp.promotion_type end = 'BOGO' THEN CAST(maximum_value AS DECIMAL(14,4))
+             WHEN case when rp.promotion_type = 'FREEITEM' and rp.min_basket_size = 0  then 'BOGO' else rp.promotion_type end = 'FLAT' THEN CAST(discount_values[1] AS DECIMAL(14,4))
+             WHEN case when rp.promotion_type = 'FREEITEM' and rp.min_basket_size = 0  then 'BOGO' else rp.promotion_type end = 'FREEITEM' THEN CAST(maximum_value AS DECIMAL(14,4))
+             END AS discount_value,
+      
+        disc.discounted_sku_uuid AS sku_uuid
+    
+    FROM
+        offers.restaurant_promo_metrics_latest rp
+        join base b on rp.restaurant_uuid = b.restaurant_uuid
+        LEFT JOIN (
+            SELECT
+                promotion_uuid
+                , di.discounteditems.skuuuid as discounted_sku_uuid
+            FROM offers.restaurant_promo_metrics_latest
+            CROSS JOIN UNNEST(discounteditems) AS di (discounteditems)
+            ) as disc on rp.promotion_uuid = disc.promotion_uuid
+    WHERE 1=1
+    
+        AND FROM_UNIXTIME(cast(rp.start_at / 1000 + 28800 as bigint)) >= DATE({{start_date}})
+        AND rp.total_budget_used > 0
+)
+
+, final AS (
+    SELECT
+        p.*,
+        DATE_FORMAT(DATE(start_at), '%Y-%m-%d') AS campaign_start, 
+        DATE_FORMAT(DATE(end_at), '%Y-%m-%d') AS campaign_scdl_end,
+        CASE
+            WHEN DATE(end_at) >= DATE(CURRENT_DATE) THEN DATE(end_at)
+            ELSE LEAST(DATE(end_at), COALESCE(DATE(revoked_deleted_at), DATE('2030-01-01')))
+            END AS campaign_actual_end,
+        DATE_DIFF('day', start_at, end_at) + 1 AS scheduled_run_days,
+        DATE_DIFF('day', start_at, LEAST(DATE(CURRENT_DATE), DATE(end_at), COALESCE(DATE(revoked_deleted_at), DATE('2030-01-01')))) + 1 AS actual_run_days,
+        SUM(total_budget_used/32.48) * MIN(coalesce(ep.funding_prop_uber, 0)) AS u_fund,
+        SUM(total_budget_used/32.48) * MIN(coalesce(ep.funding_prop_organization, 0)) AS r_fund
+    FROM 
+        promo_data p
+    JOIN
+        eds.dim_eats_promotion ep ON p.promotion_uuid = ep.uuid
+    GROUP BY
+        1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18
+)
+
+
+
+, real_quantity AS (
+    SELECT job_uuid, sku_name, sku_uuid, sku_unit_price_local, SUM(quantity) AS quantity
+    FROM (
+        SELECT DISTINCT job_uuid, line_item_uuid, array_join(regexp_extract_all(sku_name, '[一-鿿]'), '') AS sku_name, sku_uuid, sku_unit_price_local, quantity
+        FROM eds.fact_eats_order_details feod
+        JOIN base b ON feod.store_uuid = b.restaurant_uuid
+        WHERE date(feod.processed_date) BETWEEN date({{start_date}}) AND date({{end_date}})
+    )
+    GROUP BY 1, 2, 3, 4
+)
+
+
+, perf AS (
+    SELECT
+        fa.restaurant_uuid,
+        campaign_start,
+        campaign_actual_end,
+        SUM(CASE WHEN DATE(fa.datestr) BETWEEN  DATE_ADD('day',-DATE_DIFF('day', DATE(campaign_start), DATE(campaign_actual_end)),DATE(campaign_start)) AND DATE(campaign_start) - INTERVAL '1' DAY THEN meal_subtotal END) AS before_gb,
+        COUNT(CASE WHEN DATE(fa.datestr) BETWEEN DATE_ADD('day',-DATE_DIFF('day', DATE(campaign_start), DATE(campaign_actual_end)),DATE(campaign_start)) AND DATE(campaign_start) - INTERVAL '1' DAY THEN workflow_uuid END) AS before_trips,
+        SUM(CASE WHEN DATE(fa.datestr) BETWEEN DATE_ADD('day',-DATE_DIFF('day', DATE(campaign_start), DATE(campaign_actual_end)),DATE(campaign_start)) AND DATE(campaign_start) - INTERVAL '1' DAY THEN meal_subtotal END) / COUNT(CASE WHEN DATE(fa.datestr) BETWEEN DATE_ADD('day',-DATE_DIFF('day', DATE(campaign_start), DATE(campaign_actual_end)),DATE(campaign_start)) AND DATE(campaign_start) - INTERVAL '1' DAY THEN workflow_uuid END) AS before_abs,
+        SUM(CASE WHEN DATE(fa.datestr) BETWEEN DATE(campaign_start) AND DATE(campaign_actual_end) THEN meal_subtotal END) AS during_gb,
+        COUNT(CASE WHEN DATE(fa.datestr) BETWEEN DATE(campaign_start) AND DATE(campaign_actual_end) THEN workflow_uuid END) AS during_trips,
+        SUM(CASE WHEN DATE(fa.datestr) BETWEEN DATE(campaign_start) AND DATE(campaign_actual_end) THEN meal_subtotal END) / COUNT(CASE WHEN DATE(fa.datestr) BETWEEN DATE(campaign_start) AND DATE(campaign_actual_end) THEN workflow_uuid END) AS during_abs
+
+    FROM
+        final f
+    JOIN eds.fact_eats_fares_v2 fa ON fa.restaurant_uuid = f.restaurant_uuid AND DATE(fa.datestr) BETWEEN DATE_ADD('day',-DATE_DIFF('day', DATE(campaign_start), DATE(campaign_actual_end)),DATE(campaign_start)) AND  DATE_ADD('day',DATE_DIFF('day', DATE(campaign_start), DATE(campaign_actual_end)),DATE(campaign_actual_end))
+    WHERE DATE(fa.datestr) between date({{start_date}}) and date({{end_date}})
+ 
+    GROUP BY 1,2,3
+)
+
+, impression AS (
+    SELECT
+        i.restaurant_uuid,
+        campaign_start,
+        campaign_actual_end,
+        -- Feed Impression
+        SUM(CASE WHEN DATE(i.datestr) BETWEEN DATE_ADD('day',-DATE_DIFF('day', DATE(campaign_start), DATE(campaign_actual_end)),DATE(campaign_start)) AND DATE(campaign_start) - INTERVAL '1' DAY THEN n_sessions_feed_impression END) AS before_imp,
+        SUM(CASE WHEN DATE(i.datestr) BETWEEN DATE(campaign_start) AND DATE(campaign_actual_end) THEN n_sessions_feed_impression END) AS during_imp
+
+    FROM
+        final f
+    JOIN eds.agg_restaurant_funnel i ON f.restaurant_uuid = i.restaurant_uuid AND  DATE(i.datestr) BETWEEN DATE_ADD('day',-DATE_DIFF('day', DATE(campaign_start), DATE(campaign_actual_end)),DATE(campaign_start)) AND  DATE_ADD('day',DATE_DIFF('day', DATE(campaign_start), DATE(campaign_actual_end)),DATE(campaign_actual_end))
+    WHERE DATE(i.datestr) between date({{start_date}}) and date({{end_date}})
+ 
+    GROUP BY 1,2,3
+) 
+
+, eater_summary AS (
+    SELECT
+        feor.datestr AS datestr,
+        b.restaurant_uuid,
+        b.group_id,
+        COUNT(DISTINCT feor.client_uuid) AS active_eater,
+        COUNT(DISTINCT CASE WHEN feor.restaurant_client_trip_rank = 1 THEN feor.client_uuid END) AS new_eater,
+        COUNT(DISTINCT CASE WHEN feor.eater_global_order_number = 1 THEN feor.client_uuid END) AS platform_new_eater
+    FROM
+        eds.fact_eats_order_rank feor
+        JOIN
+            base b ON feor.restaurant_uuid = b.restaurant_uuid
+    WHERE 1=1
+        AND DATE(feor.datestr) between date({{start_date}}) and date({{end_date}})
+    GROUP BY 1,2,3
+)
+
+, eater AS (
+    SELECT
+        e.restaurant_uuid,
+        campaign_start,
+        campaign_actual_end,
+        SUM(CASE WHEN DATE(e.datestr) BETWEEN DATE_ADD('day',-DATE_DIFF('day', DATE(campaign_start), DATE(campaign_actual_end)),DATE(campaign_start)) AND DATE(campaign_start) - INTERVAL '1' DAY THEN active_eater END) AS before_active_eater,
+        SUM(CASE WHEN DATE(e.datestr) BETWEEN DATE(campaign_start) AND DATE(campaign_actual_end) THEN active_eater END) AS during_active_eater,
+
+        SUM(CASE WHEN DATE(e.datestr) BETWEEN DATE_ADD('day',-DATE_DIFF('day', DATE(campaign_start), DATE(campaign_actual_end)),DATE(campaign_start)) AND DATE(campaign_start) - INTERVAL '1' DAY THEN new_eater END) AS before_new_eater,
+        SUM(CASE WHEN DATE(e.datestr) BETWEEN DATE(campaign_start) AND DATE(campaign_actual_end) THEN new_eater END) AS during_new_eater,
+
+        SUM(CASE WHEN DATE(e.datestr) BETWEEN DATE_ADD('day',-DATE_DIFF('day', DATE(campaign_start), DATE(campaign_actual_end)),DATE(campaign_start)) AND DATE(campaign_start) - INTERVAL '1' DAY THEN platform_new_eater END) AS before_platform_new_eater,
+        SUM(CASE WHEN DATE(e.datestr) BETWEEN DATE(campaign_start) AND DATE(campaign_actual_end) THEN platform_new_eater END) AS during_platform_new_eater
+    FROM
+        final f
+    JOIN eater_summary e ON f.restaurant_uuid = e.restaurant_uuid AND DATE(e.datestr) BETWEEN DATE_ADD('day',-DATE_DIFF('day', DATE(campaign_start), DATE(campaign_actual_end)),DATE(campaign_start)) AND  DATE_ADD('day',DATE_DIFF('day', DATE(campaign_start), DATE(campaign_actual_end)),DATE(campaign_actual_end))
+    GROUP BY 1,2,3
+)
+
+
+SELECT DISTINCT
+        f.restaurant_uuid,
+        b.store_name,
+        f.group_id,
+        b.group_name,
+        b.city,
+        promotion_uuid,
+        '1' AS store_count,
+        promotion_type,
+        min_basket_size,
+        f.campaign_start, 
+        f.campaign_scdl_end,
+        f.campaign_actual_end,
+        scheduled_run_days,
+        CAST(actual_run_days AS VARCHAR) AS actual_run_days,
+        CAST(DATE(latest_redemption) AS VARCHAR) AS latest_redemption,
+        CAST(DATE_DIFF('day', DATE(f.campaign_start), DATE(latest_redemption) + INTERVAL '1' DAY) AS VARCHAR) AS actual_offered_days,
+        r_fund,
+        u_fund,
+        num_redemptions,
+        total_sales/32.48 AS total_sales,
+        discount_value,
+        (total_sales/32.48) / during_gb AS offer_gb_prop,
+        (1.0*num_redemptions) / (1.0*during_trips) AS redeem_rate,
+        (total_sales/32.48) / num_redemptions AS offer_abs,
+        ((total_sales/32.48) / num_redemptions) / ((during_gb) / (during_trips)) - 1 AS offer_abs_vs_regular,
+        before_gb,
+        before_trips,
+        before_abs,
+        during_gb,
+        during_trips,
+        during_abs,
+
+        before_imp,
+        during_imp,
+
+        before_active_eater,
+        during_active_eater,
+
+        before_new_eater,
+        during_new_eater,
+
+        before_platform_new_eater,
+        during_platform_new_eater,
+
+        ARRAY_JOIN(ARRAY_SORT(REMOVE_NULLS(ARRAY_AGG(DISTINCT sku_name))), ', ') AS sku_name
+FROM
+    final f
+LEFT JOIN perf p ON f.restaurant_uuid = p.restaurant_uuid AND f.campaign_start = p.campaign_start AND f.campaign_actual_end = p.campaign_actual_end
+LEFT JOIN impression i ON f.restaurant_uuid = i.restaurant_uuid AND f.campaign_start = i.campaign_start AND f.campaign_actual_end = i.campaign_actual_end
+LEFT JOIN eater e ON f.restaurant_uuid = e.restaurant_uuid AND f.campaign_start = e.campaign_start AND f.campaign_actual_end = e.campaign_actual_end
+LEFT JOIN real_quantity feod ON feod.sku_uuid=f.sku_uuid
+JOIN base b ON f.restaurant_uuid = b.restaurant_uuid
+where date(f.campaign_start) between date({{start_date}}) and date({{end_date}})
+group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39
+
+    
