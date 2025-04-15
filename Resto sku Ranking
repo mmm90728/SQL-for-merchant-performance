@@ -1,0 +1,39 @@
+WITH order_details AS (
+    SELECT
+        DATE_TRUNC('{{interval}}', DATE(t.eater_request_timestamp_local)) AS datestr,
+        d.store_uuid AS r_uuid,
+        d.sku_uuid,
+        d.sku_name,
+        d.sku_unit_price_local,
+        d.line_item_uuid,
+        d.workflow_uuid,
+        MAX(d.quantity) AS quantity,
+        COALESCE(SUM(d.customization_price_local * d.option_quantity), 0) AS customization_price
+      FROM eds.fact_eats_trip AS t
+           JOIN eds.fact_eats_order_details AS d
+             ON d.workflow_uuid = t.workflow_uuid
+     WHERE d.store_uuid IN ({{r_uuid}})
+       AND DATE(d.processed_date) BETWEEN DATE('{{start_date}}') - INTERVAL '1' DAY AND DATE('{{end_date}}')
+       AND DATE(t.datestr) BETWEEN DATE('{{start_date}}') - INTERVAL '1' DAY AND DATE('{{end_date}}')
+       AND DATE(t.eater_request_timestamp_local) BETWEEN DATE('{{start_date}}') AND DATE('{{end_date}}')
+       AND t.is_completed
+       AND (t.workflow_delivery_leg_num = 1 OR t.workflow_delivery_leg_num IS NULL)
+     GROUP BY 1,2,3,4,5,6,7
+    )
+
+SELECT
+    d.datestr,
+    d.r_uuid,
+    m.store_name,
+    d.sku_uuid,
+    d.sku_name,
+    MIN(d.sku_unit_price_local + d.customization_price) AS lower_price,
+    MAX(d.sku_unit_price_local + d.customization_price) AS upper_price,
+    SUM(d.quantity) AS quantity,
+    SUM((d.sku_unit_price_local + d.customization_price) * d.quantity) AS sales,
+    DENSE_RANK() OVER(PARTITION BY  d.datestr, d.r_uuid ORDER BY SUM(d.quantity) DESC) AS sku_rank
+  FROM eds.dim_merchant AS m
+       JOIN order_details AS d
+         ON d.r_uuid = m.uuid
+ GROUP BY 1,2,3,4,5
+ ORDER BY 1,2,10
