@@ -1,0 +1,440 @@
+WITH tw_merchant AS (
+    SELECT DISTINCT
+        m.uuid AS r_uuid, -- short for restaurant uuid
+        m.store_name,
+        sf2.acc_parentid AS group_id,
+        sf2.acc_parent_name AS group_name,
+        m.eats_store_eats_marketplace_fee AS MPF,
+        DATE(customer_won_date__c) AS cw_date,
+        DATE(m.first_order_timestamp_local) AS ft_date,
+        g.city,
+        g.district,
+        CASE WHEN m.uber_merchant_type NOT IN ('MERCHANT_TYPE_RESTAURANT','MERCHANT_TYPE_UNKNOWN') THEN 'GR'
+             WHEN REGEXP_LIKE(hc.segment_3, 'Strategic') THEN 'Strategic'
+             WHEN REGEXP_LIKE(hc.segment_3, 'MM') THEN 'Mid-Market'
+             ELSE 'Scaled' END AS team,
+        sfu.user_name AS AM,
+        CASE WHEN REGEXP_LIKE(hc.segment_3, 'AM-MM')
+             THEN SUBSTRING(segment_3, POSITION('MM ' IN segment_3) + 3, LENGTH(segment_3) - POSITION('MM ' IN segment_3) - LENGTH(SPLIT_PART(segment_3, '-', 3)) - 3)
+             ELSE 'none' END AS MM_region,
+        sf1.acc_wok_onboarding_status AS wok_onboarding_status
+    FROM eds.dim_merchant AS m
+         LEFT JOIN (
+            SELECT
+                c.city,
+                c.district,
+                c.city_id,
+                c.city_id2,
+                g.shape
+            FROM kirby_external_data.tw_geo96_to_city AS c
+            LEFT JOIN map_geofences.geofences AS g ON c.geo_uuid = g.geo_uuid
+         ) AS g ON st_contains(g.shape, 'POINT(' || CAST(m.longitude AS VARCHAR) || ' ' || CAST(m.latitude AS VARCHAR) || ')')
+         LEFT JOIN (SELECT acc_parentid, acc_rest_uuid, acc_ownerid, acc_wok_onboarding_status FROM eats_salesops.salesforce_account WHERE acc_record_type = 'Storefront') AS sf1
+                ON m.uuid = sf1.acc_rest_uuid
+         LEFT JOIN (SELECT acc_id, acc_ownerid, acc_parent_name, acc_parentid FROM eats_salesops.salesforce_account WHERE acc_record_type = 'Physical_Location') AS sf2
+                ON sf1.acc_parentid = sf2.acc_id
+         LEFT JOIN (SELECT u1.user_id, u1.user_name, u1.email, u2.user_name AS manager_name FROM eats_salesops.salesforce_user AS u1 LEFT JOIN eats_salesops.salesforce_user AS u2 ON u1.managerid = u2.user_id) AS sfu
+                ON sf2.acc_ownerid = sfu.user_id
+         LEFT JOIN (SELECT id, customer_won_date__c FROM secure_kirby_external_data.salesforce_eats_account) sf ON sf.id = sf2.acc_id
+         LEFT JOIN kirby_external_data.apac_hc_table AS hc
+                ON LOWER(hc.child_email) = LOWER(sfu.email) AND hc.country = 'Taiwan'
+    WHERE 
+               m.city_id IN (SELECT city_id FROM dwh.dim_city WHERE country_id = 195)
+               AND m.location_type <> 'DELIVERY_API'
+               AND
+      (
+        m.uuid IN ({{uuid}})
+        OR sf2.acc_parentid IN ({{br_id}})
+        OR LOWER(
+        CASE WHEN m.uber_merchant_type NOT IN ('MERCHANT_TYPE_RESTAURANT','MERCHANT_TYPE_UNKNOWN') THEN 'GR'
+             WHEN REGEXP_LIKE(hc.segment_3, 'Strategic') THEN 'Strategic'
+             WHEN REGEXP_LIKE(hc.segment_3, 'MM') THEN 'Mid-Market'
+             ELSE 'Scaled' END
+            ) = LOWER('{{team}}')
+      )
+)
+
+
+, online AS (
+    SELECT
+        DATE_TRUNC('{{interval}}', DATE(rr.datestr)) AS datestr,
+        tm.r_uuid,
+        COUNT(DISTINCT CASE WHEN rr.available_to_eaters_minutes > 0 THEN DATE(rr.datestr) END) AS online_days,
+        SUM(1.* rr.menu_available_minutes / 60) AS menu_hours,
+        SUM(1.* rr.available_to_eaters_minutes / 60) AS available_hours,
+        COALESCE(SUM(1.* rr.available_to_eaters_minutes) / NULLIF(SUM(1.* rr.menu_available_minutes), 0), 0) AS ROR   
+    FROM
+        eds.agg_hourly_restaurant_supply rr
+        JOIN tw_merchant tm ON rr.restaurant_uuid = tm.r_uuid
+    WHERE
+        DATE(rr.datestr) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+    GROUP BY
+        1, 2
+)
+
+
+, funnel AS (
+    SELECT
+        DATE_TRUNC('{{interval}}', DATE(rf.datestr)) AS datestr,
+        tm.r_uuid,
+        SUM(rf.n_sessions_any_impression) AS total_impressions,
+        SUM(rf.n_sessions_menu_impression) AS menu_clicks,
+        SUM(rf.n_sessions_cart_add) AS cart_adds,
+        COALESCE(1.* SUM(rf.n_sessions_menu_impression) / NULLIF(SUM(rf.n_sessions_any_impression), 0), 0) AS I2M,
+        COALESCE(1.* SUM(rf.n_sessions_cart_add) / NULLIF(SUM(rf.n_sessions_menu_impression), 0), 0) AS M2C,
+        COALESCE(1.* SUM(rf.n_sessions_request) / NULLIF(SUM(rf.n_sessions_cart_add), 0), 0) AS C2O,
+        COALESCE(1.* SUM(rf.n_sessions_request) / NULLIF(SUM(rf.n_sessions_menu_impression), 0), 0) AS M2O
+    FROM
+        eds.agg_restaurant_funnel rf
+        JOIN tw_merchant tm ON rf.restaurant_uuid = tm.r_uuid
+    WHERE
+        DATE(rf.datestr) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+    GROUP BY 1, 2
+)
+
+
+, fet AS (
+    SELECT
+        DATE_TRUNC('{{interval}}', DATE(fd.day)) AS datestr,
+        tm.r_uuid,
+        COUNT(DISTINCT CASE WHEN fd.completed_trips > 0 THEN DATE(fd.day) END) AS trip_days,
+        SUM(fd.requests) AS eater_requests,
+        SUM(fd.completed_trips) AS trips,
+        SUM(fd.restaurant_unaccepted_trips) AS unaccepted_trips,
+        SUM(fd.meal_subtotal_local) / 32.48 AS food_sales_usd,
+        SUM(fd.gross_bookings_local_finance) / 32.48 AS GB_usd,
+        1.* SUM(fd.meal_subtotal_local) / 32.48 / NULLIF(SUM(fd.completed_trips), 0) AS ABS_usd,
+        1.* SUM(CASE WHEN fulfillment_type = 'DELIVERY' THEN fd.total_resto_accept_time_mins END) / NULLIF(SUM(CASE WHEN fulfillment_type = 'DELIVERY' THEN fd.completed_trips END), 0) AS avg_acceptance_mins,
+        1.* SUM(CASE WHEN fulfillment_type = 'DELIVERY' THEN fd.total_resto_prep_time_mins END) / NULLIF(SUM(CASE WHEN fulfillment_type = 'DELIVERY' THEN fd.completed_trips END), 0) AS avg_preparation_mins,
+        1.* SUM(CASE WHEN fulfillment_type = 'DELIVERY' THEN fd.total_courier_wait_mins END) / NULLIF(SUM(CASE WHEN fulfillment_type = 'DELIVERY' THEN fd.completed_trips END), 0) AS avg_dp_wait_mins,
+        1.* SUM(CASE WHEN fulfillment_type = 'DELIVERY' THEN fd.total_delivery_time_mins END) / NULLIF(SUM(CASE WHEN fulfillment_type = 'DELIVERY' THEN fd.completed_trips END), 0) AS avg_total_delivery_mins
+    FROM
+        eats_salesops.fet_daily fd
+        JOIN tw_merchant tm ON fd.restaurant_uuid = tm.r_uuid
+    WHERE
+        DATE(fd.day) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+    GROUP BY 1, 2
+)
+
+, ads_metrics AS (
+    SELECT
+        DATE_TRUNC('{{interval}}', DATE(am.datestr)) AS datestr,
+        tm.r_uuid,
+        COUNT(DISTINCT CASE WHEN am.impressions > 0 THEN DATE(am.datestr) END) AS ads_days,
+        SUM(am.impressions) AS ads_impressions,
+        SUM(am.clicks) AS ads_clicks,
+        SUM(am.orders) AS ads_trips,
+        1.* SUM(am.revenue_local) / 32.48 AS ads_revenue_usd,
+        1.* SUM(am.revenue_local) / NULLIF(SUM(am.spend_local), 0) AS ROAS,
+        1.* SUM(am.spend_local) / 32.48 / NULLIF(SUM(am.clicks), 0) AS CPC
+    FROM
+        ads.ads_metrics_daily_local am
+        JOIN tw_merchant tm ON am.restaurant_uuid = tm.r_uuid
+    WHERE
+        DATE(am.datestr) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+    GROUP BY 1, 2
+)
+
+
+, net_spending AS (
+    SELECT
+        DATE_TRUNC('{{interval}}', DATE(calendar_date)) AS datestr,
+        tm.r_uuid,
+        COALESCE(SUM(ads.net_ad_spend_local) / 32.48, 0) AS net_spending_usd,
+        COALESCE(SUM(ads.ad_credit_local) / 32.48, 0) AS ads_credits_usd,
+        COALESCE(SUM(ads.net_ad_spend_local + ads.ad_credit_local) / 32.48, 0) AS total_spending_usd
+    FROM
+        ads.global_ads_billing_data ads
+        JOIN tw_merchant tm ON ads.restaurant_uuid = tm.r_uuid
+    WHERE
+        DATE(calendar_date) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+    GROUP BY 1, 2
+)
+
+
+, offers AS (
+    SELECT
+        DATE_TRUNC('{{interval}}', DATE(pr.date_local)) AS datestr,
+        tm.r_uuid,
+        ARRAY_JOIN(ARRAY_SORT(REMOVE_NULLS(ARRAY_AGG(DISTINCT ep.promotion_type))), ', ') AS promotion_type,
+        COUNT(DISTINCT CASE WHEN pr.num_redemptions > 0 THEN pr.date_local END) AS offers_days,
+        -- SUM(pr.num_redemptions) AS offers_trips,
+        SUM(pr.promo_spend_local) / 32.48 AS offer_spending_usd,
+        SUM(pr.promo_spend_local - pr.promo_spend_from_uber_local) / 32.48 AS r_fund_usd,
+        SUM(pr.promo_spend_from_uber_local) / 32.48 AS u_fund_usd
+        -- 1.* SUM(total_sales_local) / 29.91 / NULLIF(SUM(pr.num_redemptions), 0) AS offer_ABS_usd
+    FROM
+        offers.resto_promo_daily_redemptions_latest pr
+        JOIN eds.dim_eats_promotion ep ON pr.promotion_uuid = ep.uuid
+        JOIN tw_merchant tm ON pr.restaurant_uuid = tm.r_uuid
+    WHERE
+        DATE(pr.date_local) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+        AND ep.promotion_category = 'STORE_PROMOTION'
+    GROUP BY
+        1, 2
+)
+
+
+, offers_trips AS (
+    SELECT
+        DATE_TRUNC('{{interval}}', DATE(datestr)) AS datestr,
+        r_uuid,
+        SUM(offers_trip) AS offers_trips,
+        SUM(food_sales_usd) AS offers_sales_usd
+    FROM
+    (
+        SELECT DISTINCT
+            DATE(ft.eater_request_timestamp_local) AS datestr,
+            tm.r_uuid,
+            ft.order_trip_uuid,
+            CASE WHEN pr.order_trip_uuid IS NOT NULL THEN 1 END AS offers_trip,
+            ef.meal_subtotal AS food_sales_usd
+        FROM
+            eds.fact_eats_trip ft
+            JOIN eds.fact_eats_promo_redeem pr ON ft.order_trip_uuid = pr.order_trip_uuid
+            JOIN eds.fact_eats_fares_v2 ef ON ft.order_trip_uuid = ef.order_trip_uuid AND DATE(ef.datestr) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+            JOIN tw_merchant tm ON ft.restaurant_uuid = tm.r_uuid
+        WHERE
+            DATE(ft.datestr) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+            AND DATE(ft.eater_request_timestamp_local) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+            AND DATE(pr.processed_date) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+            AND pr.is_store_promotion = TRUE
+            AND ft.workflow_delivery_leg_num = 1
+            AND ft.is_completed = TRUE
+    )
+    GROUP BY 1, 2
+)
+
+
+, eater AS (
+    SELECT
+        DATE_TRUNC('{{interval}}', DATE(feor.datestr)) AS datestr,
+        tm.r_uuid,
+        COUNT(DISTINCT CASE WHEN restaurant_client_trip_rank = 1 THEN client_uuid END) AS new_eaters,
+        COUNT(DISTINCT CASE WHEN eater_global_order_number = 1 THEN client_uuid END) AS fte,
+        COUNT(DISTINCT client_uuid) - COUNT(DISTINCT CASE WHEN restaurant_client_trip_rank = 1 THEN client_uuid END) AS recurring_eaters,
+        COUNT(DISTINCT client_uuid) AS total_eaters
+    FROM
+        eds.fact_eats_order_rank feor
+        JOIN tw_merchant tm ON feor.restaurant_uuid = tm.r_uuid
+    WHERE
+        DATE(feor.datestr) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+    GROUP BY 1, 2
+)
+
+
+, rating AS (
+    SELECT
+        DATE_TRUNC('{{interval}}', DATE(rt.day)) AS datestr,
+        tm.r_uuid,
+        1.* SUM(eater_rating) / NULLIF(SUM(number_of_ratings), 0) AS eater_rating,
+        SUM(number_of_ratings) AS n_ratings
+    FROM
+        eats_salesops.agg_ratings_daily rt
+    JOIN tw_merchant tm ON rt.restaurant_uuid = tm.r_uuid
+    WHERE
+        DATE(rt.day) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+    GROUP BY 1, 2
+)
+
+, member AS (
+    SELECT
+        DATE_TRUNC('{{interval}}', DATE(ef.datestr)) AS datestr,
+        tm.r_uuid,
+        COALESCE(COUNT(DISTINCT CASE WHEN subscription_delivery_fee_discount > 0 THEN client_uuid END), 0) AS member_eaters,
+        COALESCE(COUNT(DISTINCT CASE WHEN subscription_delivery_fee_discount > 0 THEN workflow_uuid END), 0) AS member_trips,
+        COALESCE(SUM(CASE WHEN subscription_delivery_fee_discount > 0 THEN 1.* meal_subtotal * usd_fx_rate / 32.48 END), 0) AS member_food_sales_usd,
+        COALESCE(SUM(CASE WHEN subscription_delivery_fee_discount > 0 THEN 1.* meal_subtotal * usd_fx_rate / 32.48 END) / NULLIF(COUNT(DISTINCT CASE WHEN subscription_delivery_fee_discount > 0 THEN workflow_uuid END), 0), 0) AS member_ABS_usd
+    FROM
+        eds.fact_eats_fares_v2 ef
+        JOIN tw_merchant tm ON ef.restaurant_uuid = tm.r_uuid
+    WHERE
+        DATE(ef.datestr) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+        AND is_completed = TRUE
+    GROUP BY 1, 2
+)
+
+, ads_campaign AS (
+    SELECT
+        DATE_TRUNC('{{interval}}', DATE(datestr)) AS datestr,
+        r_uuid,
+        MAX_BY(budget_weekly, datestr) AS latest_ads_budget_ntd,
+        MAX(budget_weekly) AS max_ads_budget_ntd,
+        CASE WHEN MAX(is_campaign_active_in_snapshot) = FALSE THEN 'inactive' ELSE 'active' END AS ads_status,
+        MAX_BY(is_auto_bid, datestr) AS ads_auto_bid,
+        MAX_BY(manual_bid_amount, datestr) AS ads_bid_amount_ntd,
+        MAX_BY(targeting_user_history, datestr) AS ads_target_eater
+    FROM
+    (
+        SELECT
+            DATE(cd.datestr) AS datestr,
+            tm.r_uuid,
+            campaign_status,
+            is_auto_bid,
+            manual_bid_amount,
+            targeting_user_history,
+            is_campaign_active_in_snapshot,
+            CASE WHEN budget_unit = 'BUDGET_UNIT_WEEKLY' THEN budget_amount 
+                 WHEN budget_unit = 'BUDGET_UNIT_FIXED' THEN cd.budget_amount / 
+                (CASE WHEN DATE(cd.created_at_timestamp_utc) >= DATE('2024-04-22')
+                    THEN DATE_DIFF('day', cd.schedule_start_local, cd.schedule_end_local) + 1
+                    ELSE DATE_DIFF('day', cd.schedule_start_local, cd.schedule_end_local) END) * 7 
+                 WHEN budget_unit = 'BUDGET_UNIT_DAILY' THEN budget_amount*7
+                 END AS budget_weekly
+        FROM
+            ads.ads_campaign_daily_state_utc_v2 cd
+            CROSS JOIN UNNEST(stores) AS st(store)
+            JOIN tw_merchant tm ON st.store = tm.r_uuid
+        WHERE
+            DATE(cd.datestr) + INTERVAL '1' DAY  BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+    )
+    GROUP BY 1, 2
+)
+
+
+, menu as (
+    select
+       tm.r_uuid,
+       COUNT(DISTINCT CASE WHEN sku.item_price > 0 THEN sku.item_uuid END) AS sku_count,
+       AVG(CASE WHEN sku.item_price > 0 THEN sku.item_price / 100 END) AS avg_sku_price,
+       COALESCE(1.* COUNT(DISTINCT CASE WHEN LENGTH(sku.image.image_url) > 3 then item_uuid ELSE NULL END) / NULLIF(COALESCE(COUNT(DISTINCT sku.item_uuid), 0), 0), 0) AS menu_photo_coverage,
+       COALESCE(1.* COUNT(DISTINCT CASE WHEN LENGTH(sku.description) > 0 then item_uuid ELSE NULL END) / NULLIF(COALESCE(COUNT(DISTINCT sku.item_uuid), 0), 0), 0) menu_description_coverage
+    FROM eds.menu_main_items sku 
+    JOIN tw_merchant tm ON sku.restaurant_uuid = tm.r_uuid
+    GROUP BY 1
+)
+
+
+, cuisine as (
+    SELECT
+        tm.r_uuid,
+        cuisine
+    FROM
+    (
+        select
+            cs.store_uuid
+            ,ty.cuisine_cn as cuisine
+            ,row_number() over (partition by cs.store_uuid order by case when name in ('Chinese','Taiwanese') then 3 else category_level end) as rnk  
+        from uber_eats.restaurant_category cs 
+        join kirby_external_data.tw_cuisine ty on lower(replace(cs.name, ' ', '')) = lower(replace(ty.cuisine, ' ', ''))
+    ) c
+    JOIN tw_merchant tm ON c.store_uuid = tm.r_uuid
+    WHERE
+        rnk = 1
+)
+
+
+, foodpanda AS (
+    SELECT DISTINCT tm.r_uuid
+    FROM kirby_external_data.tw_foodpanda_resto jeanfp
+        left join kirby_external_data.ue_fp_id jeanid on jeanid.fp_code = jeanfp.fp_code
+        JOIN tw_merchant tm ON jeanid.ue_uuid = tm.r_uuid
+    WHERE id IS NOT NULL AND fp_name IS NOT NULL
+)
+
+
+SELECT
+       o.datestr,
+       tm.r_uuid,
+       tm.store_name,
+       tm.group_id,
+       tm.group_name,
+       tm.MPF,
+       tm.cw_date,
+       tm.ft_date,
+       tm.city,
+       tm.district,
+       tm.team,
+       tm.AM,
+       tm.MM_region,
+       c.cuisine,
+       tm.wok_onboarding_status,
+       CASE WHEN fp.r_uuid IS NOT NULL THEN TRUE ELSE FALSE END AS on_FP,
+
+       COALESCE(online_days, 0) AS online_days,
+       COALESCE(trip_days, 0) AS trip_days,
+
+       COALESCE(eater_requests, 0) AS eater_requests,
+       COALESCE(trips, 0) AS trips,
+       COALESCE(unaccepted_trips, 0) AS unaccepted_trips,
+       COALESCE(food_sales_usd, 0) AS food_sales_usd,
+       COALESCE(GB_usd, 0) AS GB_usd,
+       COALESCE(ABS_usd, 0) AS ABS_usd,
+
+       COALESCE(menu_hours, 0) AS menu_hours,
+       COALESCE(available_hours, 0) AS available_hours,
+       COALESCE(ROR, 0) AS ROR,
+       
+       COALESCE(total_impressions, 0) AS total_impressions,
+       COALESCE(menu_clicks, 0) AS menu_clicks,
+       COALESCE(cart_adds, 0) AS cart_adds,
+       COALESCE(I2M, 0) AS I2M,
+       COALESCE(M2C, 0) AS M2C,
+       COALESCE(C2O, 0) AS C2O,
+       COALESCE(M2O, 0) AS M2O,
+ 
+       COALESCE(new_eaters, 0) AS new_eaters,
+       COALESCE(recurring_eaters, 0) AS recurring_eaters,
+       COALESCE(total_eaters, 0) AS total_eaters,
+       COALESCE(fte, 0) AS fte,
+              
+       COALESCE(ads_days, 0) AS ads_days,
+       latest_ads_budget_ntd,
+       max_ads_budget_ntd,
+       ads_status,
+       ads_auto_bid,
+       ads_bid_amount_ntd,
+       ads_target_eater,
+       COALESCE(total_spending_usd, 0) AS total_spending_usd,
+       COALESCE(net_spending_usd, 0) AS net_spending_usd,
+       COALESCE(ads_credits_usd, 0) AS ads_credits_usd,
+       COALESCE(ads_impressions, 0) AS ads_impressions,
+       COALESCE(ads_clicks, 0) AS ads_clicks,
+       COALESCE(ads_trips, 0) AS ads_trips,
+       COALESCE(ads_revenue_usd, 0) AS ads_revenue_usd,
+       ROAS,
+       CPC,
+       
+       COALESCE(ofr.offers_days, 0) AS offers_days,
+       COALESCE(ofr.promotion_type, '') AS promotion_type,
+       COALESCE(ot.offers_trips, 0) AS offers_trips,
+       COALESCE(1.* ot.offers_trips / NULLIF(fe.trips, 0), 0) AS offer_redeem_rate,
+       COALESCE(ofr.offer_spending_usd, 0) AS offer_spending_usd,
+       COALESCE(ofr.r_fund_usd, 0) AS r_fund_usd,
+       COALESCE(ofr.u_fund_usd, 0) As u_fund_usd,
+       COALESCE(ot.offers_sales_usd, 0) AS offers_sales_usd,
+       COALESCE(ot.offers_sales_usd / NULLIF(ot.offers_trips, 0), 0) AS offers_ABS_usd,
+
+       sku_count,
+       avg_sku_price,
+       menu_photo_coverage,
+       menu_description_coverage,
+
+       COALESCE(member_eaters, 0) AS member_eaters,
+       COALESCE(member_trips, 0) AS member_trips,
+       COALESCE(member_food_sales_usd, 0) AS member_food_sales_usd,
+       COALESCE(member_ABS_usd, 0) AS member_ABS_usd,
+
+       eater_rating,
+       n_ratings,
+       avg_acceptance_mins,
+       avg_preparation_mins,
+       avg_dp_wait_mins,
+       avg_total_delivery_mins
+FROM
+       online o
+       JOIN tw_merchant tm ON o.r_uuid = tm.r_uuid
+       LEFT JOIN funnel fu ON o.r_uuid = fu.r_uuid AND DATE(o.datestr) = DATE(fu.datestr)
+       LEFT JOIN fet fe ON o.r_uuid = fe.r_uuid AND DATE(o.datestr) = DATE(fe.datestr)
+       LEFT JOIN ads_metrics am ON o.r_uuid = am.r_uuid AND DATE(o.datestr) = DATE(am.datestr)
+       LEFT JOIN net_spending ns ON o.r_uuid = ns.r_uuid AND DATE(o.datestr) = DATE(ns.datestr)
+       LEFT JOIN ads_campaign ac ON o.r_uuid = ac.r_uuid AND DATE(o.datestr) = DATE(ac.datestr)
+       LEFT JOIN offers ofr ON o.r_uuid = ofr.r_uuid AND DATE(o.datestr) = DATE(ofr.datestr)
+       LEFT JOIN offers_trips ot ON o.r_uuid = ot.r_uuid AND DATE(o.datestr) = DATE(ot.datestr)
+       LEFT JOIN eater e ON o.r_uuid = e.r_uuid AND DATE(o.datestr) = DATE(e.datestr)
+       LEFT JOIN rating r ON o.r_uuid = r.r_uuid AND DATE(o.datestr) = DATE(r.datestr)
+       LEFT JOIN member m ON o.r_uuid = m.r_uuid AND DATE(o.datestr) = DATE(m.datestr)
+       LEFT JOIN menu mn ON o.r_uuid = mn.r_uuid
+       LEFT JOIN cuisine c ON o.r_uuid = c.r_uuid
+       LEFT JOIN foodpanda fp ON o.r_uuid = fp.r_uuid
+ORDER BY 2, 1
