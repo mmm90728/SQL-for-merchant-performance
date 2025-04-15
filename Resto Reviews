@@ -1,0 +1,27 @@
+WITH comments AS (
+    SELECT
+        rating.subject_uuid AS r_uuid,
+        rating.job_uuid,
+        ARRAY_JOIN(ARRAY_AGG(CASE WHEN rating.schema_type <> '5-stars' THEN rating.value END), ',') AS tags_and_comments
+      FROM rawdata.schemaless_mezzanine_ratings_rows
+     WHERE rating.subject_uuid IN ({{r_uuid}})
+       AND rating.subject_type = 'store'
+       AND rating.schema_type <> '5-stars'
+       AND DATE(datestr) BETWEEN DATE('{{start_date}}') AND DATE('{{end_date}}')
+     GROUP BY 1,2
+    )
+
+SELECT
+    r.rating.subject_uuid AS r_uuid,
+    r.rating.job_uuid,
+    r.datestr,
+    r.rating.value AS stars,
+    c.tags_and_comments
+  FROM rawdata.schemaless_mezzanine_ratings_rows AS r
+       LEFT JOIN comments AS c
+              ON c.r_uuid = r.rating.subject_uuid AND c.job_uuid = r.rating.job_uuid
+ WHERE rating.subject_uuid IN ({{r_uuid}})
+   AND rating.subject_type = 'store'
+   AND rating.schema_type = '5-stars'
+   AND DATE(datestr) BETWEEN DATE('{{start_date}}') AND DATE('{{end_date}}')
+ ORDER BY 1,3
