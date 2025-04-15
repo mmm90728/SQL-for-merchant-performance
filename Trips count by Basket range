@@ -1,0 +1,60 @@
+with base as (
+    select 
+        uuid as restaurant_uuid
+        , store_name
+        , sf.acc_parent_group_name group_name
+        , pl.acc_parentid group_id
+    from eds.dim_merchant r
+    join eats_salesops.salesforce_account as sf on sf.acc_rest_uuid = r.uuid and sf.acc_record_type = 'Storefront' and acc_country = 'Taiwan'
+    join eats_salesops.salesforce_account as pl on sf.acc_parentid = pl.acc_id and pl.acc_record_type = 'Physical_Location'
+    where true
+        and r.city_id in (94,1944,1139,965,1854,1077,2090,2091,2092,2132,2157)
+        and location_type not in ('GROCERY_STORE','DELIVERY_API') 
+        and pl.acc_parentid = '{{group_id}}'
+)
+    
+,trips as (
+    select
+        date_trunc(('{{interval}}'), tp.eater_request_timestamp_local) as {{interval}}
+        , group_id
+        , tp.restaurant_uuid
+        , tp.client_uuid
+        , tp.workflow_uuid
+        ,fds.basket
+        
+    from eds.fact_eats_trip tp
+    join base b on b.restaurant_uuid = tp.restaurant_uuid
+
+    left join (select
+              workflow_uuid
+            , eater_request_timestamp_local
+            , cast((basket_usd)*usd_exchange_rate as bigint) basket
+          from secure_finance.fds_eats_vc_ops_pnl_acct_dt
+          where eater_request_timestamp_local between date('{{start_date}}') and date('{{end_date}}')
+            and date(accounting_date) >= date('2023-01-01')
+            and order_status in ('completed','COMPLETED')
+        ) fds on tp.workflow_uuid = fds.workflow_uuid 
+    
+    where true 
+        and date(tp.eater_request_timestamp_local) between date('{{start_date}}') and date('{{end_date}}')
+        and date(tp.datestr) >= date('2023-01-01')
+        and tp.is_completed = true
+        and tp.city_id in (94, 965, 1077, 1139, 1944,1854,2090,2091,2092,2132)
+)
+
+    select
+        t.{{interval}}
+        , t.group_id
+        
+        --General metrics
+        , count(distinct restaurant_uuid) as AR
+        , count(distinct workflow_uuid) as completed_trips
+        , round(sum(basket),2) as basket
+        
+        , count(distinct case when basket <= {{low_abs}} then t.workflow_uuid end) as low_abs_trips
+        , count(distinct case when basket between {{low_abs}} and {{high_abs}} then t.workflow_uuid end) as medium_abs_trips
+        , count(distinct case when basket > {{high_abs}} then t.workflow_uuid end) as high_abs_trips
+       
+    from trips t
+    group by 1,2
+    order by 1,2
