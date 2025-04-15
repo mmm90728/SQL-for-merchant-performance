@@ -1,0 +1,152 @@
+WITH tw_merchant AS (
+    SELECT DISTINCT
+          m.uuid AS restaurant_uuid
+        , m.store_name
+    FROM eds.dim_merchant AS m
+    WHERE true
+        AND m.location_type <> 'DELIVERY_API'
+        AND m.uber_merchant_type IN ('MERCHANT_TYPE_RESTAURANT','MERCHANT_TYPE_UNKNOWN')
+        AND m.is_eats_marketplace = TRUE
+        AND m.is_test_account = FALSE
+        AND m.city_id in (94,965,1077,1139,1854,1944,2090,2091,2092,2132,2157)
+        AND m.uuid in ({{restaurant_uuid}})        
+)
+
+-- Ads
+, campaign_info AS (
+    select DISTINCT 
+        DATE_TRUNC('{{interval}}',date(datestr)) as datestr
+        , store as restaurant_uuid
+        , ad_account_uuid
+        , ad_campaign_uuid
+        , ad_campaign_name
+--      , msg.order_workflow_uuid as order_workflow_uuid      
+        , ROW_NUMBER() OVER (PARTITION BY datestr, store, ad_account_uuid, ad_campaign_uuid ORDER BY date(datestr) DESC) as row_of
+    from ads.ads_campaign_daily_state_utc_v2 cd
+    cross join unnest(stores) as t (store)																								
+    where true 
+        and is_campaign_active_in_snapshot = true
+        and store in (SELECT restaurant_uuid from tw_merchant)
+        and date(datestr) between date('{{start_date}}') and date('{{end_date}}')
+)
+
+
+, ads_funnel_raw AS (
+     SELECT
+      msg.ad_account_uuid as ad_account_uuid
+    , msg.ad_campaign_uuid as ad_campaign_uuid
+    , msg.subject_uuid as restaurant_uuid
+    , DATE(DATE_ADD('hour', 8, FROM_UNIXTIME(CAST(msg.auction_timestamp_truncated / 1000 AS BIGINT)))) as auction_date_local
+    , DATE(DATE_ADD('hour', 8, FROM_UNIXTIME(CAST(msg.processing_timestamp / 1000 AS BIGINT)))) as processing_date_local
+    , msg.ad_spend_amount_e5 as ad_spend_amount_e5
+    , msg.ad_spend_currency as ad_spend_currency
+    , msg.click_count as click_count
+    , msg.impression_count as impression_count
+    , msg.event_type as event_type
+    , msg.order_amount_e5 as order_amount_e5
+    , ROW_NUMBER() OVER (PARTITION BY msg.record_uuid ORDER BY msg.auction_timestamp_truncated DESC, msg.processing_timestamp DESC) AS dedupe_by_record -- for funnel counting
+    , ROW_NUMBER() OVER (PARTITION BY msg.order_workflow_uuid, msg.event_type ORDER BY msg.auction_timestamp_truncated DESC, msg.processing_timestamp DESC) AS dedupe_by_workflow -- for orders counting
+  FROM rawdata_user.kafka_hp_ads_metrics_ads_metrics_pinot_nodedup
+  WHERE 1=1
+    AND msg.ad_campaign_uuid IN (SELECT ad_campaign_uuid FROM campaign_info)
+    AND msg.subject_uuid IN (SELECT restaurant_uuid FROM campaign_info)
+    AND date(datestr) between date('{{start_date}}')  - interval '1' month and date('{{end_date}}') + interval '1' month 
+)
+
+, order_count as (
+    SELECT 
+          DATE_TRUNC('{{interval}}', date(auction_date_local)) AS datestr
+        , ad_account_uuid
+        , ad_campaign_uuid
+        , restaurant_uuid
+        , SUM(CASE WHEN event_type='CLICK' THEN 1 ELSE 0 end) as orders
+        , SUM(CASE WHEN event_type='CLICK' THEN order_amount_e5 ELSE 0 end) / 100000.0 as revenue_local
+        , SUM(CASE WHEN event_type='IMPRESSION' THEN 1 ELSE 0 end)  as exposed_orders
+        , SUM(CASE WHEN event_type='IMPRESSION' THEN order_amount_e5 ELSE 0 end) / 100000.0 as exposed_revenue_local
+    FROM ads_funnel_raw
+    WHERE 1=1
+        and dedupe_by_workflow = 1       
+        and date(auction_date_local) between date('{{start_date}}') and date('{{end_date}}')
+    GROUP BY 1,2,3,4
+)
+
+
+, funnel_count as (
+    SELECT 
+          DATE_TRUNC('{{interval}}', date(auction_date_local)) AS datestr
+        , ad_account_uuid
+        , ad_campaign_uuid
+        , restaurant_uuid
+        , SUM(click_count) as clicks
+        , SUM(impression_count) as impressions
+        , SUM(ad_spend_amount_e5) / 100000.0 as served_ad_spend_local
+    FROM ads_funnel_raw
+    WHERE 1=1
+        and dedupe_by_record = 1    
+        and date(auction_date_local) between date('{{start_date}}') and date('{{end_date}}')
+    GROUP BY 1,2,3,4
+)
+
+,kwtlist as(
+    SELECT DISTINCT ad_campaign_uuid as klist,
+    DATE_TRUNC('{{interval}}', date(datestr)) AS datestr
+    FROM ads.keyword_perf
+    WHERE matched_keyword IS NOT NULL AND match_type_evaluation IS NOT NULL
+    and date(datestr) BETWEEN date('{{start_date}}') and date('{{end_date}}'))
+
+
+,kwsl_order as(
+select 
+        distinct 
+        oc.datestr,
+        restaurant_uuid,
+        sum(CASE WHEN klist IS NOT NULL THEN orders END) as kwt_orders,
+        sum(CASE WHEN klist IS  NULL THEN orders END) as sl_orders,
+        
+        sum(CASE WHEN klist IS NOT NULL THEN revenue_local END) as kwt_sales,
+        sum(CASE WHEN klist IS NULL THEN revenue_local END) as sl_sales
+        
+from order_count oc
+LEFT JOIN kwtlist k on k.klist = oc.ad_campaign_uuid
+AND k.datestr = oc.datestr
+WHERE date(oc.datestr) BETWEEN date('{{start_date}}') and date('{{end_date}}')
+group by 1,2)
+
+
+,kwsl_funnel as(
+select 
+        distinct 
+        fc.datestr,
+        restaurant_uuid,
+        sum(CASE WHEN klist IS NOT NULL THEN clicks END) as kwt_clicks,
+        sum(CASE WHEN klist IS  NULL THEN clicks END) as sl_clicks,
+        
+        sum(CASE WHEN klist IS NOT NULL THEN impressions END) as kwt_impressions,
+        sum(CASE WHEN klist IS  NULL THEN impressions END) as sl_impressions
+        
+from funnel_count fc
+LEFT JOIN kwtlist k on k.klist = fc.ad_campaign_uuid
+AND k.datestr = fc.datestr
+WHERE date(fc.datestr) BETWEEN date('{{start_date}}') and date('{{end_date}}')
+group by 1,2)
+
+
+SELECT distinct
+    datestr
+    , restaurant_uuid
+    , store_name
+    , kwt_impressions
+    , sl_impressions
+    , kwt_clicks
+    , sl_clicks
+    , kwt_orders
+    , sl_orders
+    , kwt_sales
+    , sl_sales
+    
+FROM campaign_info
+LEFT JOIN kwsl_order using(datestr,restaurant_uuid)
+LEFT JOIN kwsl_funnel using(datestr,restaurant_uuid)
+LEFT JOIN tw_merchant using(restaurant_uuid)
+WHERE restaurant_uuid in ({{restaurant_uuid}}) and row_of=1
+ORDER BY 1,2
