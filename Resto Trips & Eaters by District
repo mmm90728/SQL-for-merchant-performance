@@ -1,0 +1,29 @@
+select 
+DATE_TRUNC('{{interval}}', DATE(t.eater_request_timestamp_local))  AS datestr,
+t.restaurant_uuid,
+g.city,
+g.district,
+count(distinct t.workflow_uuid) as completed_trips,
+count(distinct t.client_uuid) as eaters 
+
+from eds.fact_eats_trip t
+LEFT JOIN (
+            SELECT
+                c.city,
+                c.district,
+                c.city_id,
+                c.city_id2,
+                g.shape
+            FROM kirby_external_data.tw_geo96_to_city AS c
+            JOIN map_geofences.geofences AS g ON c.geo_uuid = g.geo_uuid
+         ) AS g ON st_contains(g.shape, 'POINT(' || CAST(t.courier_dropoff_lng AS VARCHAR) || ' ' || CAST(t.courier_dropoff_lat AS VARCHAR) || ')')
+
+where 1=1 
+and t.eater_request_timestamp_local between cast('{{start}}' as timestamp) and cast('{{end}}' as timestamp)
+and t.city_id in (94,1944,1139,965,1854,1077,2090,2091,2092,2132,2157)
+and t.datestr >= '2020-01-01'
+and t.is_completed = true 
+and t.restaurant_uuid in ({{resto_uuid}})
+
+group by 1,2,3,4 
+order by 1,2
