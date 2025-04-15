@@ -1,0 +1,46 @@
+WITH total_orders AS (
+  
+  SELECT COUNT(DISTINCT workflow_uuid) AS total_order_count
+  FROM eds.fact_eats_trip
+  WHERE restaurant_uuid IN ({{r_uuid}})
+    AND is_completed
+    AND DATE(datestr) BETWEEN DATE('{{start_date}}') AND DATE('{{end_date}}')
+),
+
+total_sales AS (
+  
+  SELECT SUM(d.sku_unit_price_local * d.quantity) AS total_sales_amount
+  FROM eds.fact_eats_trip t
+  JOIN eds.fact_eats_order_details d ON d.workflow_uuid = t.workflow_uuid
+  WHERE d.store_uuid IN ({{r_uuid}})
+    AND t.is_completed
+    AND DATE(d.processed_date) BETWEEN DATE('{{start_date}}') AND DATE('{{end_date}}')
+    AND DATE(t.datestr) BETWEEN DATE('{{start_date}}') AND DATE('{{end_date}}')
+)
+
+SELECT 
+  DATE_TRUNC('{{interval}}', DATE(t.datestr)) AS datestr,
+  d.store_uuid AS r_uuid,
+  d.sku_name,
+  SUM(d.quantity) AS quantity,
+  SUM(d.sku_unit_price_local * d.quantity) AS sku_sales,
+  ROUND(
+    COUNT(DISTINCT d.workflow_uuid) * 100.0 / total_orders.total_order_count, 5
+  ) AS sku_order_pct,
+  ROUND(
+    SUM(d.sku_unit_price_local * d.quantity) * 100.0 / total_sales.total_sales_amount, 5
+  ) AS sku_sales_pct
+
+FROM eds.fact_eats_trip t
+JOIN eds.fact_eats_order_details d 
+  ON d.workflow_uuid = t.workflow_uuid
+JOIN total_orders ON 1=1
+JOIN total_sales ON 1=1
+
+WHERE d.store_uuid IN ({{r_uuid}})
+  AND DATE(d.processed_date) BETWEEN DATE('{{start_date}}') AND DATE('{{end_date}}')
+  AND DATE(t.datestr) BETWEEN DATE('{{start_date}}') AND DATE('{{end_date}}')
+  AND t.is_completed
+
+GROUP BY 1,2,3, total_orders.total_order_count, total_sales.total_sales_amount
+ORDER BY 1,2
