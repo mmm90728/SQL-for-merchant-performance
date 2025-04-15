@@ -1,0 +1,159 @@
+SET session hash_partition_count=64;
+
+WITH aa AS(
+    SELECT
+        COALESCE(acc2.uuid__c,acc.uuid__c) AS restaurant_uuid,
+        dm.store_name,
+        MAX_BY(acc.ownerid,acc.lastmodifieddate) AS acc_user_id,
+        MAX_BY(acc3.ownerid,acc.lastmodifieddate) AS parent_user_id,
+        MAX_BY(acc3.id,acc.lastmodifieddate) AS group_id,
+        MAX_BY(acc3.name,acc.lastmodifieddate) AS group_name
+    FROM secure_kirby_external_data.salesforce_eats_account acc
+		LEFT JOIN secure_kirby_external_data.salesforce_eats_account acc2 ON acc.id = acc2.parentid
+		LEFT JOIN secure_kirby_external_data.salesforce_eats_account acc3 ON acc3.id = acc.parentid AND acc3.record_type__c = 'Group_Account'
+		JOIN eds.dim_merchant dm ON COALESCE(acc2.uuid__c,acc.uuid__c) = dm.uuid
+	WHERE
+		acc.record_type__c  IN ('Physical_Location', 'UberEverything_Account_Record_Type')
+        AND acc.service_country__c IN ('Taiwan')
+        AND acc.isdeleted <> TRUE
+    GROUP BY 1, 2
+)
+
+, base AS (
+    SELECT * FROM aa
+    WHERE restaurant_uuid IN ({{store_uuid}})
+    OR group_id IN ({{group_uuid}})
+)
+
+
+, promo_data AS(
+    SELECT
+        rp.restaurant_uuid,
+        rp.promotion_uuid,
+        FROM_UNIXTIME(cast(start_at / 1000 + 28800 as bigint)) AS start_at,
+        FROM_UNIXTIME(cast(end_at / 1000 + 28800 as bigint)) AS end_at,
+        case when rp.promotion_type = 'FREEITEM' and rp.min_basket_size = 0  then 'BOGO' else rp.promotion_type end as promotion_type,
+        disc.discounted_sku_uuid AS sku_uuid,
+        rp.min_basket_size,
+        rp.total_budget_used,
+        rp.num_redemptions,
+        rp.perc_discount,
+        rp.discount_values[1] AS discount_values
+    FROM
+        offers.restaurant_promo_metrics_latest rp
+        LEFT JOIN (
+            SELECT
+                promotion_uuid
+                , di.discounteditems.skuuuid as discounted_sku_uuid
+            FROM offers.restaurant_promo_metrics_latest
+            CROSS JOIN UNNEST(discounteditems) AS di (discounteditems)
+            ) as disc on rp.promotion_uuid = disc.promotion_uuid
+    WHERE 1=1
+        AND FROM_UNIXTIME(cast(rp.end_at / 1000 + 28800 as bigint)) >= DATE({{start_date}})
+        AND rp.total_budget_used > 0
+)
+
+
+
+, real_quantity AS (
+    SELECT job_uuid, sku_name, sku_uuid, sku_unit_price_local, SUM(quantity) AS quantity
+    FROM (
+        SELECT DISTINCT job_uuid, line_item_uuid, sku_name, sku_uuid, sku_unit_price_local, quantity
+        FROM eds.fact_eats_order_details feod
+        JOIN base b ON feod.store_uuid = b.restaurant_uuid
+        WHERE date(feod.processed_date) BETWEEN date({{start_date}}) AND date({{end_date}})
+    )
+    GROUP BY 1, 2, 3, 4
+)
+
+            
+
+, offer_summary_trip AS (
+    select DISTINCT
+        DATE_TRUNC('{{interval}}', date(r.processed_date)) as datestr,
+    	rp.restaurant_uuid,
+    	rp.promotion_type,
+    	rp.start_at,
+    	rp.end_at,
+    	rp.sku_uuid,
+        feod.sku_name,
+        feod.sku_unit_price_local,
+        
+        rp.promotion_uuid,
+        rp.num_redemptions,
+        rp.total_budget_used,
+        r.order_trip_uuid,
+        CASE
+            WHEN rp.promotion_type IN ('FREEITEM') THEN 1
+            WHEN rp.promotion_type IN ('DISCOUNTEDITEM') THEN feod.quantity
+            WHEN rp.promotion_type IN ('FLAT') THEN 1
+            WHEN rp.promotion_type IN ('BOGO') THEN FLOOR(feod.quantity/2)
+            END AS redemptions,
+        CASE 
+            WHEN rp.promotion_type IN ('BOGO') THEN feod.sku_unit_price_local * FLOOR(feod.quantity/2)
+            WHEN rp.promotion_type IN ('FREEITEM') THEN feod.sku_unit_price_local
+            WHEN rp.promotion_type IN ('DISCOUNTEDITEM') THEN feod.sku_unit_price_local * rp.perc_discount * feod.quantity
+            ELSE discount_values END AS amount_used,
+        CASE
+            WHEN rp.promotion_type IN ('FREEITEM') THEN sku_unit_price_local
+            WHEN rp.promotion_type IN ('DISCOUNTEDITEM') THEN perc_discount
+            WHEN rp.promotion_type IN ('FLAT') THEN discount_values
+            WHEN rp.promotion_type IN ('BOGO') THEN sku_unit_price_local
+            END AS discount_value
+    from promo_data rp
+        JOIN eds.fact_eats_promo_redeem r on rp.promotion_uuid = r.promotion_uuid
+        LEFT JOIN real_quantity feod on r.order_trip_uuid = feod.job_uuid and rp.sku_uuid = feod.sku_uuid
+        JOIN base b ON rp.restaurant_uuid = b.restaurant_uuid
+    WHERE 1=1
+        AND date(r.processed_date) BETWEEN date({{start_date}}) AND date({{end_date}})
+)
+
+
+, offer_summary AS (
+    SELECT
+        datestr,
+        restaurant_uuid,
+        promotion_uuid,
+        DATE_FORMAT(DATE(start_at), '%Y-%m-%d') AS campaign_start, 
+        DATE_FORMAT(DATE(end_at), '%Y-%m-%d') AS campaign_end,
+        p.promotion_type,
+        num_redemptions AS campaign_total_redemption,
+        total_budget_used AS campaign_total_spending,
+        sku_uuid AS item_uuid,
+        sku_name AS item_name,
+        sku_unit_price_local AS item_price,
+        discount_value,
+        SUM(redemptions) AS item_redemptions,
+        SUM(amount_used) AS item_spending,
+        SUM(amount_used) * MIN(coalesce(ep.funding_prop_uber, 0)) AS u_fund,
+        SUM(amount_used) * MIN(coalesce(ep.funding_prop_organization, 0)) AS r_fund
+    FROM
+        offer_summary_trip p
+    JOIN
+        eds.dim_eats_promotion ep ON p.promotion_uuid = ep.uuid
+    GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12
+    HAVING SUM(redemptions) > 0
+)
+
+
+SELECT 
+    datestr,
+    group_id,
+    group_name,
+    restaurant_uuid,
+    store_name,
+    promotion_type,
+    item_uuid,
+    item_name,
+    item_price,
+    discount_value,
+    SUM(item_redemptions) AS item_redemptions,
+    ROUND(SUM(item_spending), 2) AS item_spending,
+    u_fund,
+    r_fund
+FROM offer_summary
+JOIN base USING(restaurant_uuid)
+GROUP BY 1,2,3,4,5,6,7,8,9,10,13,14
+HAVING SUM(item_redemptions) > 0
+ORDER BY restaurant_uuid, promotion_type, item_price, datestr
+    
