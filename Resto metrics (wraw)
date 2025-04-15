@@ -1,0 +1,365 @@
+
+
+WITH Days AS 
+(
+    SELECT date_id AS Day
+    FROM dwh.dim_date dd
+    WHERE 1=1
+    AND date_id between DATE({{start_date}}) and DATE({{end_date}}) 
+)
+
+
+, acc AS
+(
+SELECT DISTINCT   
+-- WOK Details
+    dm.uuid
+    , dm.store_name
+    , dc.city_name
+    , CASE WHEN dc.country_name = 'Taiwan (ROC)' THEN 'Taiwan' 
+            WHEN dc.country_name IN ('Australia','New Zealand') THEN 'ANZ' ELSE dc.country_name END AS country
+    , sf2.acc_parentid AS br_id
+    , sf2.acc_parent_name AS br_name
+    , sfu.user_name AS pl_owner
+    
+-- Account Info
+FROM eds.dim_merchant dm
+    LEFT JOIN (SELECT acc_parentid, acc_rest_uuid, acc_ownerid, acc_wok_onboarding_status FROM eats_salesops.salesforce_account WHERE acc_record_type = 'Storefront') AS sf1
+                ON dm.uuid = sf1.acc_rest_uuid
+         LEFT JOIN (SELECT acc_id, acc_ownerid, acc_parent_name, acc_parentid FROM eats_salesops.salesforce_account WHERE acc_record_type = 'Physical_Location') AS sf2
+                ON sf1.acc_parentid = sf2.acc_id
+         LEFT JOIN (SELECT u1.user_id, u1.user_name, u1.email, u2.user_name AS manager_name FROM eats_salesops.salesforce_user AS u1 LEFT JOIN eats_salesops.salesforce_user AS u2 ON u1.managerid = u2.user_id) AS sfu
+                ON sf2.acc_ownerid = sfu.user_id
+    left JOIN dwh.dim_city dc ON dc.city_id = dm.city_id AND dc.country_id IN (195)
+     
+
+WHERE 1=1 
+    AND dm.is_eats_marketplace = TRUE
+    AND dm.is_test_account = FALSE
+    AND dm.city_id IN (SELECT city_id FROM dwh.dim_city WHERE country_id = 195)
+    AND dm.location_type <> 'DELIVERY_API'
+)
+
+, perf AS
+(
+    SELECT
+        DATE_FORMAT(DATE_TRUNC('{{interval}}', DATE(dl.order_final_state_timestamp_utc + INTERVAL '8' HOUR)), '%Y-%m-%d') AS datestr,
+        store_uuid AS restaurant_uuid,
+        SUM(1.*CASE WHEN is_completed = TRUE THEN food_sales_local END / exchange_rate) AS gb,
+        AVG(1.*CASE WHEN is_completed = TRUE THEN food_sales_local END / exchange_rate) AS abs,
+        COUNT(DISTINCT CASE WHEN store_client_trip_rank = 1 AND is_completed = TRUE THEN client_uuid END) AS new_eater,
+        COUNT(DISTINCT CASE WHEN is_completed = TRUE THEN client_uuid END) AS active_eater,
+        SUM(CASE WHEN dl.is_completed = TRUE THEN 1 END) AS trip
+        
+    FROM
+        merchant.fact_eats_data_lake_orders dl
+    JOIN dwh.fact_usd_exchange_rates ex ON date(dl.datestr) = date(ex.date_id) and ex.currency_code = 'TWD'
+    JOIN acc acc ON dl.store_uuid = acc.uuid
+    WHERE
+        dl.city_id IN (94,1944,1139,965,1854,1077,2090,2091,2092,2132,2157)
+        AND DATE(dl.datestr) BETWEEN DATE({{start_date}}) - INTERVAL '1' DAY AND DATE({{end_date}}) + INTERVAL '1' DAY
+        AND DATE(dl.order_final_state_timestamp_utc + INTERVAL '8' HOUR) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+    GROUP BY
+        1, 2
+)
+
+
+, ROR AS 
+(
+   SELECT
+      h.restaurant_uuid,
+      DATE_TRUNC('{{interval}}', DATE(start_timestamp_local)) AS datestr,
+      SUM(CAST(available_to_eaters_minutes AS DECIMAL(8,2)))/60 AS total_available_to_eaters_hour
+      
+   FROM
+      eds.agg_hourly_restaurant_supply h
+   JOIN acc acc ON h.restaurant_uuid = acc.uuid
+   WHERE
+      CAST(start_timestamp_local AS DATE)
+     			BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+      AND DATE(datestr) >= DATE({{start_date}})
+      AND h.city_id IN (94,1944,1139,965,1854,1077,2090,2091,2092,2132,2157)
+   GROUP BY
+      1, 2 
+)
+
+
+, ss AS 
+(
+   SELECT
+      DATE_TRUNC('{{interval}}', DATE(datestr)) AS datestr,
+      f.restaurant_uuid,
+      SUM(n_sessions_feed_impression) AS sessions_feed_impression,
+      SUM(n_sessions_menu_impression) AS sessions_menu_impression 
+   FROM
+      eds.agg_restaurant_funnel f
+   JOIN acc acc ON f.restaurant_uuid = acc.uuid
+   WHERE
+	  DATE(datestr) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+      AND f.city_id IN (94,1944,1139,965,1854,1077,2090,2091,2092,2132,2157)
+   GROUP BY
+      1, 2
+)
+
+,perf_summary AS (
+    SELECT
+       p.*,
+       ror.total_available_to_eaters_hour AS AH,
+       imp.sessions_feed_impression AS feed_impression,
+       imp.sessions_menu_impression AS menu_impression
+    FROM
+        perf AS p
+    JOIN
+        ROR AS ror ON p.restaurant_uuid = ror.restaurant_uuid AND DATE(p.datestr) = DATE(ror.datestr)
+    LEFT JOIN
+        ss AS imp ON p.restaurant_uuid = imp.restaurant_uuid AND DATE(p.datestr) = DATE(imp.datestr)
+    WHERE ror.total_available_to_eaters_hour > 0    
+)
+
+
+, ads_budget AS (
+    SELECT 
+            acc.uuid,
+            DATE_FORMAT(DATE_TRUNC('{{interval}}', DATE(datestr)), '%Y-%m-%d') AS datestr,
+            sum(budget_local) as latest_ads_budget
+    FROM ads.ads_campaign_budget_daily u
+    JOIN acc acc ON u.restaurant_uuid = acc.uuid
+    WHERE DATE(datestr) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+    GROUP BY 1,2
+    )
+
+, ads_credits_spending AS (
+    SELECT
+        DATE_FORMAT(DATE_TRUNC('{{interval}}', date(start_time)), '%Y-%m-%d') AS datestr,
+        ab.restaurant_uuid,
+        (SUM(ab.credit_total) + SUM(ab.money_total)) / 100000.0 AS actual_ad_spend
+    FROM ads.ads_billing_charge_restaurant_requests AS ab
+    JOIN acc acc ON ab.restaurant_uuid = acc.uuid
+      AND DATE(ab.start_time) BETWEEN DATE({{start_date}})
+                                 AND DATE({{end_date}})
+      AND DATE(end_time) >= DATE({{start_date}}) - INTERVAL '7' DAY
+    GROUP BY 1, 2
+)
+
+, ads_metrics as (
+select
+    DATE_FORMAT(date_trunc('{{interval}}',date(ds.datestr)), '%Y-%m-%d') as datestr
+    ,ds.restaurant_uuid
+    --, ROUND(sum(cast(ds.impressions as double)), 2) as impressions
+    --, ROUND(sum(cast(ds.clicks as double)), 2) as clicks
+    --, ROUND(sum(cast(ds.spend_usd*ex.exchange_rate as double)), 2) AS spending
+    --, ROUND(case when sum(cast(ds.clicks as double)) > 0 then sum(cast(ds.clicks as double))/sum(cast(ds.impressions as double)) else 0 end, 4) as ctr
+    --, ROUND(case when sum(cast(ds.orders as double)) > 0 then sum(cast(ds.orders as double))/sum(cast(ds.clicks as double)) else 0 end, 4) as cvr
+    --, ROUND(case when sum(cast(ds.orders as double)) > 0 then sum(cast(ds.exposed_orders as double))/sum(cast(ds.clicks as double)) else 0 end, 4) as exposed_cvr
+    --, ROUND(sum(cast(ds.revenue_usd*ex.exchange_rate as double)), 2) as revenue_local
+    --, ROUND(sum(cast(ds.revenue_usd as double)), 2) as revenue_usd
+    --, ROUND(case when sum(cast(ds.clicks as double)) > 0 then sum(cast(ds.spend_usd*ex.exchange_rate as double))/sum(cast(ds.clicks as double)) else 0 end, 2) as cpc_local
+    --, ROUND(case when sum(cast(ds.clicks as double)) > 0 then sum(cast(ds.spend_usd as double))/sum(cast(ds.clicks as double)) else 0 end, 2) as cpc_usd
+    --, ROUND(case when sum(cast(ds.orders as double)) > 0 then sum(cast(ds.spend_usd*ex.exchange_rate as double))/sum(cast(ds.orders as double)) else 0 end, 2) as cpo_local
+    --, ROUND(case when sum(cast(ds.orders as double)) > 0 then sum(cast(ds.spend_usd as double))/sum(cast(ds.orders as double)) else 0 end, 2) as cpo_usd
+    --, ROUND(sum(cast(ds.orders as double)), 2) as ads_orders
+    --, ROUND(sum(cast(ds.exposed_orders as double)), 2) as exposed_ads_orders  
+    --, ROUND(sum(cast(ds.exposed_revenue_usd*ex.exchange_rate as double)), 2) as exposed_revenue_local
+    --, ROUND(sum(cast(ds.exposed_revenue_usd as double)), 2) as exposed_revenue_usd
+    --, ROUND(case when sum(cast(ds.spend_usd as double)) > 0 then sum(cast(ds.revenue_usd as double))/sum(cast(ds.spend_usd as double)) else 0 end, 2) as roas
+    --, ROUND(case when sum(cast(ds.spend_usd as double)) > 0 then sum(cast(ds.exposed_revenue_usd as double))/sum(cast(ds.spend_usd as double)) else 0 end, 2) as exposed_roas 
+  
+from ads.ads_metrics_daily_utc ds
+join dwh.fact_usd_exchange_rates ex on date(ds.datestr) = date(ex.date_id) and ds.currency_code = ex.currency_code
+JOIN acc acc ON ds.restaurant_uuid = acc.uuid
+where date(ds.datestr) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+    AND ds.city_id IN (94,1944,1139,965,1854,1077,2090,2091,2092,2132,2157)
+group by 1,2
+)
+
+
+, ads_summary AS (
+    SELECT
+        am.*,
+        ac.actual_ad_spend,
+        ab.latest_ads_budget
+    FROM
+        ads_metrics am
+    LEFT JOIN ads_credits_spending ac ON DATE(am.datestr) = DATE(ac.datestr) AND am.restaurant_uuid = ac.restaurant_uuid
+    LEFT JOIN ads_budget ab ON DATE(am.datestr) = DATE(ab.datestr) AND am.restaurant_uuid = ab.uuid
+)
+
+
+, offer_summary AS (
+    SELECT
+        DATE_FORMAT(date_trunc('{{interval}}', DATE(pr.processed_date)), '%Y-%m-%d') as datestr,
+        rp.restaurant_uuid,
+        ARRAY_JOIN(ARRAY_AGG(DISTINCT case when rp.promotion_type = 'FREEITEM' and rp.min_basket_size = 0  then 'BOGO' else rp.promotion_type end), ',') as promotion_type,
+        sum(amount_used_local) amount_used_local
+    
+    FROM
+        eds.fact_eats_promo_redeem pr
+        JOIN offers.restaurant_promo_metrics_latest rp ON pr.promotion_uuid = rp.promotion_uuid
+        JOIN merchant.fact_eats_data_lake_orders dl ON pr.order_trip_uuid = dl.order_uuid
+        JOIN dwh.fact_usd_exchange_rates ex ON date(dl.datestr) = date(ex.date_id) and ex.currency_code = 'TWD'
+        JOIN acc acc ON rp.restaurant_uuid = acc.uuid
+    WHERE
+        DATE(pr.processed_date) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+        AND DATE(dl.datestr) BETWEEN DATE({{start_date}}) AND DATE({{end_date}})
+        AND rp.city_id IN (94,1944,1139,965,1854,1077,2090,2091,2092,2132,2157)
+        AND dl.is_completed = TRUE
+    GROUP BY 1,2
+)
+
+
+, base_gb AS (
+    SELECT
+        uuid,
+        AVG(base_gb) AS base_gb_weekly
+    FROM
+    (
+        SELECT
+            DATE_FORMAT(date_trunc('week', DATE(datestr)), '%Y-%m-%d') as datestr,
+            acc.uuid,
+            SUM(meal_subtotal) AS base_gb 
+        FROM
+            eds.fact_eats_fares_v2 fa
+        JOIN acc acc ON fa.restaurant_uuid = acc.uuid
+        WHERE DATE(datestr) BETWEEN 
+        -- Calculate the Monday 36 weeks before the end_date
+        DATE_ADD('day', -((DAY_OF_WEEK(CAST({{start_date}} AS DATE)) % 7 + 8 + 36*7)), CAST({{start_date}} AS DATE))
+        AND
+        -- Calculate the previous previous Sunday (two Sundays ago)
+        DATE_ADD('day', -(DAY_OF_WEEK(CAST({{start_date}} AS DATE)) % 7 + 8), CAST({{start_date}} AS DATE))
+        GROUP BY 1, 2
+    )
+    GROUP BY 1
+)
+
+, ads_spend AS -- Getting ads_spend in local
+(
+    SELECT DATE_TRUNC('{{interval}}', date(calendar_date)) AS Day
+        , restaurant_uuid as restaurant_uuid
+        , SUM(CASE WHEN country_id = 195 THEN ads.net_ad_spend_local /32.48 END) AS net_spend
+    FROM ads.global_ads_billing_data ads 
+        JOIN eds.dim_merchant dm ON dm.uuid = ads.restaurant_uuid 
+        JOIN dwh.dim_city dc ON country_id IN (195) and dc.city_id = dm.city_id
+    WHERE 1=1 
+        AND DATE(calendar_date) >= DATE({{start_date}}) 
+        AND DATE(calendar_date) <= DATE({{end_date}})
+        
+    GROUP BY 1,2
+)
+
+, ads_daily as
+(
+    SELECT date_trunc('{{interval}}',date(d.day)) as day
+        , asp.restaurant_uuid
+        , acc.store_name
+        , acc.br_id
+        , acc.br_name
+        , acc.country
+        , acc.city_name
+        , CASE WHEN net_spend >= 0 THEN net_spend ELSE 0 END AS net_spend
+
+    FROM Days d
+        join ads_spend asp on asp.day = d.day
+        join acc acc on asp.restaurant_uuid = acc.uuid
+    WHERE 1=1
+        AND d.day >= DATE({{start_date}}) 
+        AND d.day <= DATE({{end_date}})
+        and acc.country in ('Taiwan')
+    GROUP BY 1,2,3,4,5,6,7,8
+    ORDER BY 1,2
+)
+
+
+
+
+,final as(
+select 
+    COALESCE(p.datestr, a.datestr) AS datestr,
+    acc.uuid,
+    acc.br_name as group_name,
+    acc.br_id as group_id,
+    acc.store_name as store_name,
+    acc.pl_owner as AM,
+    case
+    --minor team--
+    when acc.pl_owner in  ('Frank Hsu','Hayden Chen','Lynn Lin','Wendy Yang','Maggie Lin','Howard Lee','Jayden Lim')  then 'N1'
+    when acc.pl_owner in  ('Benjamin Mo', 'Brian Chen', 'Dori Chang','Tracy Li', 'Ivory Chu', 'Wayne Lo','Tim Liu') then 'N2'
+    when acc.pl_owner in  ('Angela Tsai', 'Benjamin Jen', 'David Lo', 'Kim Hsueh', 'Nicole Lee','Vicky Huang') then 'N3'
+    when acc.pl_owner in  ('Amber You', 'Lisa Chen', 'Youjun Liu', 'Meifu Wang', 'Teddy Lin','Louise Lin') then 'N4' 
+    when acc.pl_owner in  ('Rainer Tseng', 'Bob Tseng', 'Shiuany Yan', 'Emma Huang', 'Ann Chuang', 'Jessie Huang','Gwen Fang') then 'C1'
+    when acc.pl_owner in  ('Viktor Hung', 'Ray Chen', 'Elaine Kao', 'Melody Chen', 'Kyle Chiang','Maggie Huang','Yung Chen Huang','Cindy Tsai','Chris Tsai','Jennifer Chen') then 'C2'
+    when acc.pl_owner in  ('Sally Tsai', 'Rainer Tseng', 'Mia Liu','Ikea Huang', 'Iris Lee', 'Kelly Mao', 'Ian Huang','Mark Huang')  then 'S1'
+    else 'Ro' end as minor_teams,
+    --Major team--
+    case
+    when acc.pl_owner in  ( 'Frank Hsu', 'Hayden Chen', 'Lynn Lin', 'Wendy Yang', 'Maggie Lin','Howard Lee','Jayden Lim',
+                        'Benjamin Mo', 'Brian Chen', 'Dori Chang','Tracy Li', 'Ivory Chu', 'Wayne Lo','Tim Liu',
+                        'Angela Tsai', 'Benjamin Jen', 'David Lo', 'Kim Hsueh', 'Nicole Lee','Vicky Huang',
+                        'Amber You', 'Lisa Chen', 'Youjun Liu', 'Meifu Wang', 'Teddy Lin','Louise Lin',
+                        'Paula Liu', 'Bob Tseng', 'Shiuany Yan', 'Emma Huang', 'Ann Chuang', 'Jessie Huang','Gwen Fang',
+                        'Viktor Hung', 'Ray Chen', 'Elaine Kao', 'Melody Chen', 'Kyle Chiang','Maggie Huang','Yung Chen Huang','Cindy Tsai','Chris Tsai','Jennifer Chen',
+                        'Sally Tsai', 'Rainer Tseng', 'Mia Liu','Ikea Huang', 'Iris Lee', 'Kelly Mao', 'Ian Huang','Mark Huang') then 'MM'
+    when acc.pl_owner in  ('Borg Lai', 'Kane Yang', 'Justin Chu', 'Ann Lin', 'Billy Lin', 'Innis Chuang', 'Ken Ko', 'Show Huang', 'Jessie Peng', 'Richard Liao')  then 'STR'
+    else 'Ro' end as major_teams,
+    sum(net_spend*32.48) as billed_spending,
+
+    -- performance
+    p.trip AS trips,
+    p.gb AS GB_usd,
+    p.abs AS ABS,
+    p.AH AS active_hour,
+    p.active_eater,
+    p.new_eater,
+
+    p.feed_impression,
+    p.menu_impression,
+    COALESCE(CAST(p.trip AS DECIMAL(10,4))/ NULLIF(CAST(p.menu_impression AS DECIMAL(10,4)), 0), 0) AS menu_CVR,
+
+    -- offer
+    o.promotion_type,
+    o.amount_used_local AS offer_spending,
+    a.latest_ads_budget AS ads_budget,
+    
+    bg.base_gb_weekly
+  
+from
+    perf_summary p LEFT JOIN offer_summary o ON DATE(p.datestr) = DATE(o.datestr) AND p.restaurant_uuid = o.restaurant_uuid
+    LEFT JOIN ads_summary a ON DATE(p.datestr) = DATE(a.datestr) AND p.restaurant_uuid = a.restaurant_uuid
+    FULL JOIN acc acc ON p.restaurant_uuid = acc.uuid
+    LEFT JOIN base_gb bg ON p.restaurant_uuid = bg.uuid
+    LEFT JOIN ads_daily ads ON  DATE(p.datestr) = DATE(ads.day) AND p.restaurant_uuid = ads.restaurant_uuid
+WHERE p.AH > 0
+GROUP BY 1,2,3,4,5,6,7,8,10,11,12,13,14,15,16,17,18,19,20,21,22
+ORDER BY datestr DESC,  AM, GB_usd DESC
+)
+
+--By uuids--
+,uuids as (
+SELECT * from final
+where true
+and uuid in ({{uuids}})
+)
+--By brand_id--
+,brand_ids as (
+SELECT * from final 
+WHERE TRUE
+and group_id in ({{brand_ids}}) 
+)
+--By AM--
+,am_names as(
+SELECT * from final
+WHERE TRUE
+and AM in ({{am_names}})
+)
+--by minor_teams(only MM!)--
+,minor_teams as(
+SELECT * from final
+WHERE TRUE
+and minor_teams in ({{minor_teams}})
+)
+,major_teams as(
+SELECT * from final
+WHERE TRUE
+and major_teams in ({{major_teams}})
+)
+select * from {{By_uuids_or_brand_ids_or_am_names_or_minor_teams_or_major_teams}}
+where TRUE
