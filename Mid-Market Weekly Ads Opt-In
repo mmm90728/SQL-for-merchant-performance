@@ -1,0 +1,135 @@
+with tw_geo AS (
+    SELECT
+        tg.geo_uuid,
+        tg.city_name AS city,
+        tg.geo_name AS geo,
+        tg.geo_segment,
+        g.shape
+    FROM kirby_external_data.tw_geo_202305 AS tg
+         JOIN map_geofences.geofences AS g
+           ON tg.geo_uuid = g.geo_uuid
+    )
+
+-- tw restos
+, tw_merchant AS (
+    SELECT DISTINCT
+        m.uuid AS r_uuid, -- short for restaurant uuid
+        m.store_name,
+        sfu.user_name AS acc_owner,
+        sf2.acc_parentid AS br_id,
+        sf2.acc_parent_name AS br_name,
+        CASE WHEN m.uber_merchant_type NOT IN ('MERCHANT_TYPE_RESTAURANT','MERCHANT_TYPE_UNKNOWN') THEN 'NV'
+             WHEN REGEXP_LIKE(hc.segment_3, 'Strategic') THEN 'Strategic'
+             WHEN REGEXP_LIKE(hc.segment_3, 'MM') THEN 'Mid-Market'
+             ELSE 'Scale' END AS segment,
+        case when segment_1 = 'Mid-Market' then substring(hc.segment_3,7,2)
+             when segment_1 = 'Strategic' then 'Strategic' 
+             else 'Scale' end team
+    FROM eds.dim_merchant AS m
+         LEFT JOIN tw_geo AS g
+                ON st_contains(g.shape, 'POINT(' || cast(m.longitude as varchar) || ' ' || cast(m.latitude as varchar) || ')')
+         LEFT JOIN (SELECT acc_parentid, acc_rest_uuid, acc_ownerid, acc_wok_onboarding_status FROM eats_salesops.salesforce_account WHERE acc_record_type IN ('Storefront', 'Archived_Storefront')) AS sf1
+                ON m.uuid = sf1.acc_rest_uuid
+         LEFT JOIN (SELECT acc_id, acc_ownerid, acc_parentid, acc_parent_name FROM eats_salesops.salesforce_account WHERE acc_record_type = 'Physical_Location') AS sf2
+                ON sf1.acc_parentid = sf2.acc_id
+         LEFT JOIN (SELECT u1.user_id, u1.user_name, u1.email, u2.user_name AS manager_name FROM eats_salesops.salesforce_user AS u1 LEFT JOIN eats_salesops.salesforce_user AS u2 ON u1.managerid = u2.user_id) AS sfu
+                ON sf2.acc_ownerid = sfu.user_id
+         LEFT JOIN kirby_external_data.apac_hc_table AS hc
+                ON LOWER(hc.child_email) = LOWER(sfu.email) AND hc.country = 'Taiwan'
+         LEFT JOIN kirby_external_data.dim_merchant_tw_profile AS c 
+                ON m.uuid = c.r_uuid
+    WHERE m.city_id IN (94,965,1077,1139,1854,1944,2090,2091,2092,2132,2157)
+      AND m.location_type <> 'DELIVERY_API'
+      AND m.uber_merchant_type IN ('MERCHANT_TYPE_RESTAURANT','MERCHANT_TYPE_UNKNOWN')
+    )
+    
+
+--ad spend
+, campaign_spend  as (
+  Select
+    DATE_TRUNC('week', date(calendar_date)) as calendar_date,
+    restaurant_uuid as r_uuid,
+    ad_account_uuid,
+    campaign_uuid AS ad_campaign_uuid,
+    sum(net_ad_spend_local) as net_ad_spend_local
+    
+    FROM ads.global_ads_billing_data
+    WHERE date(calendar_date) between date({{start_date}}) and date({{end_date}})
+    GROUP BY 1,2,3,4
+)
+    
+,kwtlist as(
+    SELECT DISTINCT ad_campaign_uuid as klist,
+    DATE_TRUNC('week', CAST(datestr AS date)) AS datestr
+    FROM ads.keyword_perf
+    WHERE matched_keyword IS NOT NULL AND match_type_evaluation IS NOT NULL
+    and date(datestr) BETWEEN date({{start_date}}) and date({{end_date}}))
+
+
+,kwsldata as(
+select 
+        distinct r_uuid,
+        calendar_date,
+        count(distinct(CASE WHEN klist IS NOT NULL THEN klist END)) as nofkwt,
+        count(distinct(CASE WHEN klist IS  NULL THEN ad_account_uuid END)) as nofsl,
+        sum(CASE WHEN klist IS NOT NULL THEN net_ad_spend_local END) as kwt_ad_spend,
+        sum(CASE WHEN klist IS  NULL THEN net_ad_spend_local END) as sl_ad_spend
+from campaign_spend
+LEFT JOIN kwtlist k on k.klist = ad_campaign_uuid
+AND k.datestr = calendar_date
+WHERE date(calendar_date) BETWEEN date({{start_date}}) and date({{end_date}})
+group by 1,2)
+
+
+,final as (
+SELECT 
+    calendar_date,
+    segment,
+    team,
+    acc_owner,
+    br_id,
+    br_name,
+    r_uuid,
+    store_name,
+    coalesce(nofsl,0) as sl,
+    sl_ad_spend/32.48 as sl_ad_spend,
+    coalesce(nofkwt,0) as kwt,
+    kwt_ad_spend/32.48 as kwt_ad_spend
+FROM tw_merchant 
+LEFT JOIN kwsldata using (r_uuid)
+WHERE segment NOT IN ('Scale', 'Strategic')
+AND date(calendar_date) BETWEEN date({{start_date}}) and date({{end_date}})
+ORDER BY 1,6)
+
+--By uuids--
+,uuids as (
+SELECT * from final
+where true
+and r_uuid in ({{uuids}})
+)
+--By brand_id--
+,brand_ids as (
+SELECT * from final 
+WHERE TRUE
+and br_id in ({{brand_ids}}) 
+)
+--By AM--
+,am_names as(
+SELECT * from final
+WHERE TRUE
+and acc_owner in ({{am_names}})
+)
+--by minor_teams(only MM!)--
+,minor_teams as(
+SELECT * from final
+WHERE TRUE
+and team in ({{minor_teams}})
+)
+,major_teams as(
+SELECT * from final
+WHERE TRUE
+and segment in ({{major_teams}})
+)
+
+select * from {{By_uuids_or_brand_ids_or_am_names_or_minor_teams_or_major_teams}}
+where TRUE
