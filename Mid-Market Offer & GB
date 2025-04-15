@@ -1,0 +1,103 @@
+-- tw cities id
+WITH tw_merchant AS (
+    SELECT DISTINCT
+        m.uuid AS r_uuid, -- short for restaurant uuid
+        m.store_name,
+        sfu.user_name AS acc_owner,
+        sf2.acc_parentid AS br_id,
+        sf2.acc_parent_name AS br_name,
+        CASE WHEN REGEXP_LIKE(hc.segment_3, 'Strategic') THEN 'Strategic'
+             WHEN REGEXP_LIKE(hc.segment_3, 'MM') THEN 'Mid-Market'
+             ELSE 'Scale' END AS team,
+
+    FROM eds.dim_merchant AS m
+    LEFT JOIN (select * from kirby_external_data.tw_368geo join map_geofences.geofences using (geo_uuid, name)) g on st_contains(shape,'POINT('||cast(m.longitude as varchar)||' '||cast(m.latitude as varchar)||')') 
+         LEFT JOIN (SELECT acc_parentid, acc_rest_uuid, acc_ownerid, acc_wok_onboarding_status FROM eats_salesops.salesforce_account WHERE acc_record_type = 'Storefront') AS sf1
+                ON m.uuid = sf1.acc_rest_uuid
+         LEFT JOIN (SELECT acc_id, acc_ownerid, acc_parentid, acc_parent_name FROM eats_salesops.salesforce_account WHERE acc_record_type = 'Physical_Location') AS sf2
+                ON sf1.acc_parentid = sf2.acc_id
+         LEFT JOIN (SELECT u1.user_id, u1.user_name, u1.email, u2.user_name AS manager_name FROM eats_salesops.salesforce_user AS u1 LEFT JOIN eats_salesops.salesforce_user AS u2 ON u1.managerid = u2.user_id) AS sfu
+                ON sf2.acc_ownerid = sfu.user_id
+         LEFT JOIN kirby_external_data.apac_hc_table AS hc
+                ON LOWER(hc.child_email) = LOWER(sfu.email) AND hc.country = 'Taiwan'
+    WHERE TRUE
+      AND m.city_id in (94,965,1077,1139,1854,1944,2090,2091,2092,2132,2157)
+      AND m.location_type <> 'DELIVERY_API'
+      AND m.uber_merchant_type IN ('MERCHANT_TYPE_RESTAURANT','MERCHANT_TYPE_UNKNOWN')
+      AND (REGEXP_LIKE(hc.segment_3, 'MM'))
+      AND
+      (
+        m.uuid IN ({{uuid}})
+        OR sf2.acc_parentid IN ({{br_id}})
+       )
+    )
+
+, trips AS (
+    SELECT
+        DATE_TRUNC('{{interval}}', DATE(t.eater_request_timestamp_local)) AS interval_,
+        m.r_uuid,
+        COUNT(DISTINCT t.workflow_uuid) AS trips,
+        SUM(fds.gross_bookings_usd * fds.usd_exchange_rate) / 32.48 AS gb,
+        SUM(fds.basket_usd * fds.usd_exchange_rate) / 32.48 AS basket
+      FROM eds.fact_eats_trip AS t
+           JOIN secure_finance.fds_eats_vc_ops_pnl_acct_dt AS fds
+             ON fds.workflow_uuid = t.workflow_uuid
+           JOIN tw_merchant AS m
+             ON m.r_uuid = t.restaurant_uuid
+     WHERE 1=1
+       AND t.is_completed = TRUE
+       AND DATE(t.datestr) BETWEEN DATE('{{start}}') AND DATE('{{end}}')
+       AND DATE(fds.accounting_date) BETWEEN DATE('{{start}}') AND DATE('{{end}}')
+       AND DATE(t.eater_request_timestamp_local) BETWEEN DATE('{{start}}') AND DATE('{{end}}')
+     GROUP BY 1,2
+    )
+
+, promo AS (
+    SELECT
+        DATE(DATE_ADD('HOUR', 8, r.redeem_timestamp)) AS day_of,
+        m.r_uuid,
+        COUNT(DISTINCT r.order_trip_uuid) AS num_redemption,
+        SUM(r.amount_used_local * (1-COALESCE(funding_prop_uber, 0)) / 32.48) AS rfo,
+        SUM(r.amount_used_local * (COALESCE(funding_prop_uber, 0)) / 32.48) AS u_fund
+      FROM eds.fact_eats_promo_redeem AS r
+           JOIN eds.dim_eats_promotion AS dep
+             ON dep.uuid = r.promotion_uuid AND dep.promotion_category = 'STORE_PROMOTION'
+           JOIN tw_merchant AS m
+             ON m.r_uuid = dep.store_uuid_constraint
+     WHERE DATE(r.processed_date) BETWEEN DATE('{{start}}') AND DATE('{{end}}') 
+       AND DATE(DATE_ADD('HOUR', 8, r.redeem_timestamp)) BETWEEN DATE('{{start}}') AND DATE('{{end}}')
+     GROUP BY 1,2
+    )
+
+, offers AS (
+    SELECT
+        DATE_TRUNC('{{interval}}', day_of) AS interval_,
+        r_uuid,
+        SUM(rfo) AS rfo,
+        SUM(u_fund) AS u_fund,
+        COUNT(num_redemption) AS num_redemption
+      from promo
+     GROUP BY 1,2
+    )
+
+SELECT
+    o.interval_,
+    team,
+    m.r_uuid,
+    m.store_name,
+    m.br_id,
+    m.br_name,
+    m.city,
+    -- m.geo,
+    m.acc_owner,
+    COALESCE(trips, 0) AS trips,
+    COALESCE(gb, 0) AS gb,
+    num_redemption,
+    rfo,
+    u_fund
+  FROM offers AS o
+       LEFT JOIN trips AS t
+              ON t.r_uuid = o.r_uuid AND t.interval_ = o.interval_
+       JOIN tw_merchant AS m
+         ON m.r_uuid = o.r_uuid
+ ORDER BY 1,2,3
