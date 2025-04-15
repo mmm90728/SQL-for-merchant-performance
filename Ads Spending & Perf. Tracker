@@ -1,0 +1,251 @@
+with acc AS (
+    select distinct
+        date_trunc('{{interval}}',date(date_id)) interval_,
+        city,
+        district,
+        Region,
+        substring(hc.segment_3,7,2) Team,
+        sfu.manager_name AM_manager,
+        sfu.user_name AM,
+        sf2.acc_parentid AS group_id,
+        sf2.acc_parent_name AS group_name,
+        m.uuid AS restaurant_uuid,
+        m.store_name
+    from eds.dim_merchant AS m 
+    left join (select * from map_geofences.geofences join kirby_external_data.tw_368geo using(geo_uuid,name)) b 
+           on st_contains(b.shape, 'POINT(' || cast(m.longitude as varchar) || ' ' || cast(m.latitude as varchar) || ')')
+         LEFT JOIN (SELECT acc_parentid, acc_rest_uuid, acc_ownerid, acc_wok_onboarding_status FROM eats_salesops.salesforce_account WHERE acc_record_type = 'Storefront') AS sf1
+                ON m.uuid = sf1.acc_rest_uuid
+         LEFT JOIN (SELECT acc_id, acc_ownerid, acc_parentid, acc_parent_name FROM eats_salesops.salesforce_account WHERE acc_record_type = 'Physical_Location') AS sf2
+                ON sf1.acc_parentid = sf2.acc_id
+         LEFT JOIN (SELECT u1.user_id, u1.user_name, u1.email, u2.user_name AS manager_name FROM eats_salesops.salesforce_user AS u1 LEFT JOIN eats_salesops.salesforce_user AS u2 ON u1.managerid = u2.user_id) AS sfu
+                ON sf2.acc_ownerid = sfu.user_id
+         LEFT JOIN kirby_external_data.apac_hc_table AS hc
+                ON LOWER(hc.child_email) = LOWER(sfu.email) AND hc.country = 'Taiwan'
+        cross join dwh.dim_date
+    WHERE true
+      and case when {{is_auto}} = 1 
+          then date(date_id) >= date_add('{{interval}}',-8,date_trunc('{{interval}}',current_date))
+          else date(date_id) between date('{{start}}') and date('{{end}}') end
+      AND m.location_type <> 'DELIVERY_API'
+      AND m.uber_merchant_type IN ('MERCHANT_TYPE_RESTAURANT','MERCHANT_TYPE_UNKNOWN')
+      AND REGEXP_LIKE(hc.segment_3,'MM')
+      AND
+      (
+        m.uuid IN ({{uuid}})
+        OR sf2.acc_parentid IN ({{br_id}})
+       )
+    )
+
+
+, trips as(
+    SELECT 
+        date_trunc('{{interval}}',date(fet.eater_request_timestamp_local)) as interval_ 
+        , fet.restaurant_uuid as restaurant_uuid
+        , COUNT(DISTINCT fet.workflow_uuid) AS Trips 
+        , SUM(gross_bookings_usd*usd_exchange_rate) AS GB
+    FROM eds.fact_eats_trip fet
+    LEFT JOIN secure_finance.fds_eats_vc_ops_pnl_acct_dt fds ON fet.workflow_uuid = fds.workflow_uuid AND DATE(fds.accounting_date) >= DATE('2023-01-01') 
+    WHERE 1=1
+        AND fet.is_completed = TRUE
+        and case when {{is_auto}} = 1 
+            then date(fet.eater_request_timestamp_local) >= date_add('{{interval}}',-8,date_trunc('{{interval}}',current_date))
+                 and date(fet.eater_request_timestamp_local) < date_trunc('{{interval}}',current_date)
+            else date(fet.eater_request_timestamp_local) between date('{{start}}') and date('{{end}}') end
+        and case when {{is_auto}} = 1 
+            then date(fet.datestr) >= date_add('{{interval}}',-8,date_trunc('{{interval}}',current_date))
+            else date(fet.datestr) between date('{{start}}') and date('{{end}}') end
+        and fet.city_id in (94,965,1077,1139,1854,1944,2090,2091,2092,2132,2157)
+    GROUP BY 1,2
+)
+
+, ads as (
+    select date_trunc('{{interval}}',DATE(datestr)) AS interval_
+        , restaurant_uuid
+        , sum(session_revenue) as session_revenue
+        , sum(impressions) as ads_imps
+        , sum(clicks) as ads_clicks 
+        , sum(spend_local) as ads_spent
+        , sum(orders) as ads_orders 
+        , sum(revenue_local) as ads_revenue 
+        , sum(exposed_orders) as exposed_orders
+        , sum(exposed_revenue_local) as exposed_revenue
+        
+    from ads.ads_metrics_daily_local ad
+    where true 
+        and case when {{is_auto}} = 1 
+            then date(datestr) >= date_add('{{interval}}',-8,date_trunc('{{interval}}',current_date))
+                 and date(datestr) < date_trunc('{{interval}}',current_date)
+            else date(datestr) between date('{{start}}') and date('{{end}}') end
+        and country_id = 195
+    group by 1,2
+)
+
+, ads_spent as (
+    select date_trunc('{{interval}}',date(datestr)) as interval_
+        , uuid restaurant_uuid
+        , sum(coalesce(net_billed_ad_spend,0))/32.481 as ads_kpi_spent
+        , sum(coalesce(billed_ad_spend,0))/32.481 as ads_bu_spent
+        , sum(coalesce(ad_credit+ad_cofund,0))/32.481 as ad_credit
+    from ua_dataops.ads_anr_sot ads 
+    where true 
+        and case when {{is_auto}} = 1 
+            then date(datestr) >= date_add('{{interval}}',-8,date_trunc('{{interval}}',current_date))
+                 and date(datestr) < date_trunc('{{interval}}',current_date)
+            else date(datestr) between date('{{start}}') and date('{{end}}') end
+        AND house_ads_flag = 'No'
+    group by 1,2
+)
+
+
+, expo as (
+    select
+         date_trunc('{{interval}}',date(datestr)) as interval_
+        , restaurant_uuid 
+        , sum(coalesce(n_sessions_any_impression,0)) as total_expo 
+        , sum(coalesce(n_sessions_menu_impression,0)) as total_menu 
+        , sum(coalesce(n_sessions_request,0)) as total_request 
+    from eds.agg_restaurant_funnel 
+    where true 
+        and case when {{is_auto}} = 1 
+            then date(datestr) >= date_add('{{interval}}',-8,date_trunc('{{interval}}',current_date))
+                 and date(datestr) < date_trunc('{{interval}}',current_date)
+            else date(datestr) between date('{{start}}') and date('{{end}}') end
+        and city_id in (94, 965, 1077, 1139, 1944,1854,2090,2091,2092,2132)
+    group by 1,2
+)
+
+, dates as (
+    select date_id
+    from dwh.dim_date 
+    where   case when {{is_auto}} = 1 
+            then date(date_id) >= date_add('{{interval}}',-8,date_trunc('{{interval}}',current_date))
+                 and date(date_id) < date_trunc('{{interval}}',current_date)
+            else date(date_id) between date('{{start}}') and date('{{end}}') end
+)
+
+, budget_daily as (
+
+        select 
+            date(datestr) + interval '1' DAY AS datestr, 
+            ad_account_uuid, 
+            ad_campaign_uuid,
+            store as restaurant_uuid, 
+            is_multi_location_campaign, 
+            case when budget_unit = 'BUDGET_UNIT_WEEKLY' then budget_amount 
+                 when budget_unit = 'BUDGET_UNIT_FIXED' then budget_amount / 
+                (case when date(created_at_timestamp_utc) >= date('2024-04-22')
+                      then DATE_DIFF('day', schedule_start_local, schedule_end_local)+1
+                      else DATE_DIFF('day', schedule_start_local, schedule_end_local) end)*7
+                 when budget_unit = 'BUDGET_UNIT_DAILY' then budget_amount*7
+                  end as weekly_budget
+        from ads.ads_campaign_daily_state_utc_v2 cd
+        cross join unnest(stores) as t (store)
+        where TRUE
+        and campaign_status = 'active'
+        and case when {{is_auto}} = 1 
+            then date(datestr)+ interval '1' DAY >= date_add('{{interval}}',-8,date_trunc('{{interval}}',current_date))
+                 and date(datestr)+ interval '1' DAY < date_trunc('{{interval}}',current_date)
+            else date(datestr)+ interval '1' DAY between date('{{start}}') and date('{{end}}') end       
+        and city_id in (94, 965, 1077, 1139, 1944,1854,2090,2091,2092,2132)
+)
+
+, multi_loc AS ( --計算is_multi_location_campaign的餐廳數量
+SELECT 
+    bd.datestr, 
+    bd.ad_account_uuid, 
+    bd.ad_campaign_uuid,
+    COUNT(DISTINCT bd.restaurant_uuid) as n_locs
+  FROM ads.ads_campaign_metrics_daily_local AS acmdl
+       JOIN budget_daily AS bd
+         ON DATE(acmdl.datestr) = bd.datestr
+        AND acmdl.ad_account_uuid = bd.ad_account_uuid
+        AND acmdl.campaign_uuid = bd.ad_campaign_uuid
+        AND acmdl.restaurant_uuid = bd.restaurant_uuid
+ WHERE TRUE
+  AND case when {{is_auto}} = 1 
+        THEN DATE(acmdl.datestr) >= date_add('{{interval}}',-8,date_trunc('{{interval}}',current_date)) 
+             and DATE(acmdl.datestr) < date_trunc('{{interval}}',current_date)
+        else DATE(acmdl.datestr) between date('{{start}}') and date('{{end}}') end  
+   AND bd.is_multi_location_campaign
+   AND acmdl.impressions > 0
+   AND acmdl.city_id IN (94,965,1077,1139,1854,1944,2090,2091,2092,2132,2157)
+ GROUP BY 1,2,3
+)
+
+
+,week_budget as (
+
+select  date_trunc('{{interval}}',date(datestr)) as interval_,
+        restaurant_uuid, 
+        ad_campaign_uuid,
+        SUM(weekly_budget) / 7.0 as ops_budget
+from(
+    Select 
+        bd.datestr, 
+        bd.ad_account_uuid, 
+        bd.ad_campaign_uuid, 
+        bd.restaurant_uuid,
+        bd.is_multi_location_campaign, 
+        case when bd.is_multi_location_campaign then bd.weekly_budget/ml.n_locs else bd.weekly_budget end as weekly_budget
+    FROM budget_daily bd
+    LEFT JOIN multi_loc ml ON bd.ad_account_uuid = ml.ad_account_uuid
+           and bd.ad_campaign_uuid = ml.ad_campaign_uuid
+           and bd.datestr = ml.datestr 
+)
+group by 1,2,3
+)
+
+, ops_budget as (
+select  interval_,
+        restaurant_uuid, 
+        sum(ops_budget) as ops_budget 
+  from week_budget
+  group by 1,2
+)
+
+, Open as (
+    select 
+         date_trunc('{{interval}}',date(datestr)) as interval_
+        ,restaurant_uuid 
+        ,round(sum(available_to_eaters_minutes)*1.0/60,2) as available_hour
+--        ,round(sum(menu_available_minutes)*1.0/60,2) as menu_hour
+    from eds.agg_hourly_restaurant_supply as hr
+    where true 
+        and hr.city_id in (94, 965, 1077, 1139, 1944,1854,2090,2091,2092,2132)
+        and case when  {{is_auto}} = 1  then date(datestr) >= date_add('{{interval}}',-8,date_trunc('{{interval}}',current_date))
+                                        and date(datestr) < date_trunc('{{interval}}',current_date)
+        else DATE(datestr) between date('{{start}}') and date('{{end}}') end                                  
+    group by 1,2
+)
+
+select date_format(date_trunc('{{interval}}',interval_),'%Y-%m-%d') as "{{interval}}"
+    ,team
+    ,AM
+    ,group_id
+    ,group_name
+    ,restaurant_uuid
+    ,store_name
+ 
+    ,sum(Trips) as total_trips 
+    ,sum(GB)/32.481 as total_GB 
+    
+--Ads (align KPI, 先在 subquery 換匯再 round)
+    ,round(sum(ads_bu_spent),5) as "Ads Total Spent" 
+    ,round(sum(ads_kpi_spent),5) as "Net Ads Rev"
+    
+    ,sum(coalesce(case when ads_imps>0 then ops_budget end,0))/32.481 as "Total Budget"
+    ,sum(available_hour) as "Available Hour"
+
+
+
+from acc
+left join trips using (restaurant_uuid,interval_)
+left join ads  using(restaurant_uuid,interval_)
+left join expo using(restaurant_uuid,interval_)
+left join ops_budget using(restaurant_uuid,interval_)
+left join ads_spent  using(restaurant_uuid,interval_)
+left join Open  using(restaurant_uuid,interval_)
+where case when {{is_auto}} = 1 then interval_ < date_trunc('{{interval}}',current_date) else true end 
+group by 1,2,3,4,5,6,7
+order by 1,2,3,4,5,6,7
